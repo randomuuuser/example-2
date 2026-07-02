@@ -1,0 +1,42 @@
+import numpy as np
+from bokeh.plotting import figure, show
+from bokeh.models import ColumnDataSource
+from bokeh.palettes import Category10
+
+# --- Données exemple ---
+np.random.seed(0)
+n = 30
+classes = np.random.choice(["A", "B", "C"], n)
+x = np.random.rand(n)
+y = np.random.rand(n)
+
+unique_classes = sorted(set(classes))
+palette = Category10[max(3, len(unique_classes))]
+color_map = {c: palette[i] for i, c in enumerate(unique_classes)}
+
+p = figure(width=700, height=500, title="Emails par classe",
+           tools="pan,wheel_zoom,box_zoom,reset,hover",
+           tooltips=[("classe", "@cls")])
+
+for c in unique_classes:
+    mask = classes == c
+    source = ColumnDataSource(dict(
+        x=x[mask], y=y[mask],
+        cls=[c] * mask.sum(),
+        emoji=["📧"] * mask.sum(),
+    ))
+
+    # Rectangle coloré en fond (distinction de classe)
+    p.rect(x="x", y="y", width=0.04, height=0.04,
+           color=color_map[c], alpha=0.45, source=source,
+           legend_label=c)
+
+    # Emoji par-dessus
+    p.text(x="x", y="y", text="emoji", source=source,
+           text_font_size="14px", text_align="center",
+           text_baseline="middle")
+
+p.legend.click_policy = "hide"
+p.legend.title = "Classe"
+
+show(p)
