@@ -1,0 +1,139 @@
+import numpy as np
+from scipy.spatial.distance import pdist
+
+
+# --------------------------------------------------------------------------- #
+# 1. NORMALIZED STRESS  (Kruskal, 1964) — préservation GLOBALE des distances
+# --------------------------------------------------------------------------- #
+
+def normalized_stress(X_high, X_low, metric="cosine", sample=2000, seed=42):
+    """
+    Normalized stress : écart entre les distances paire-à-paire en HD et dans
+    la projection. Complément de Shepard (rang) : ici on mesure l'écart de
+    VALEUR des distances, pas seulement l'ordre.
+
+      stress = sqrt( sum( (d_high - d_low)^2 ) / sum( d_high^2 ) )
+
+    ∈ [0, +inf[, plus BAS = mieux. 0 = distances parfaitement préservées.
+    Typiquement : <0.1 très bon, 0.1-0.3 correct, >0.3 distances peu fiables.
+
+    `sample` : sous-échantillonne si N grand (nb de paires en O(N^2)).
+    """
+    n = len(X_high)
+    rng = np.random.default_rng(seed)
+    if n > sample:
+        idx = rng.choice(n, sample, replace=False)
+        X_high, X_low = X_high[idx], X_low[idx]
+
+    d_high = pdist(X_high, metric=metric)
+    d_low = pdist(X_low, metric="euclidean")
+
+    return float(np.sqrt(np.sum((d_high - d_low) ** 2) / np.sum(d_high ** 2)))
+
+
+# --------------------------------------------------------------------------- #
+# 2. DIAGNOSTIC — interprétation lisible des métriques
+# --------------------------------------------------------------------------- #
+
+def diagnostic(metrics, n_classes=None):
+    """
+    Affiche un diagnostic en langage clair à partir d'un dict de métriques.
+    Toutes les clés sont optionnelles : seules celles présentes sont commentées.
+
+    Clés reconnues : trustworthiness, continuity, neighborhood_hit,
+    shepard_spearman, normalized_stress, silhouette.
+    n_classes : sert à situer neighborhood_hit vs le hasard (1/n_classes).
+    """
+    def verdict(value, thresholds, labels):
+        # thresholds croissants ; renvoie le label du 1er seuil non dépassé
+        for t, lab in zip(thresholds, labels):
+            if value < t:
+                return lab
+        return labels[-1]
+
+    print("=" * 60)
+    print("DIAGNOSTIC — lecture des métriques")
+    print("=" * 60)
+
+    m = metrics
+
+    if "trustworthiness" in m:
+        v = m["trustworthiness"]
+        lab = verdict(v, [0.7, 0.9], ["faible", "correcte", "excellente"])
+        print(f"\n• Trustworthiness = {v:.3f} -> préservation locale {lab}")
+        print("  (les voisins affichés sont-ils de vrais voisins ?)")
+
+    if "continuity" in m:
+        v = m["continuity"]
+        lab = verdict(v, [0.7, 0.9], ["faible", "correcte", "excellente"])
+        print(f"\n• Continuity = {v:.3f} -> voisins d'origine conservés : {lab}")
+        print("  (les vrais voisins sont-ils restés proches ?)")
+
+    if "neighborhood_hit" in m:
+        v = m["neighborhood_hit"]
+        chance = (1 / n_classes) if n_classes else None
+        lab = verdict(v, [0.5, 0.8], ["faible", "moyenne", "bonne"])
+        print(f"\n• Neighborhood Hit = {v:.3f} -> séparation des classes {lab}")
+        if chance is not None:
+            print(f"  (hasard ≈ {chance:.2f} pour {n_classes} classes ; "
+                  f"{'bien au-dessus' if v > 2 * chance else 'proche'} du hasard)")
+        print("  (mes voisins immédiats partagent-ils mon label ?)")
+
+    if "shepard_spearman" in m:
+        v = m["shepard_spearman"]
+        lab = verdict(v, [0.3, 0.6], ["faible", "modérée", "bonne"])
+        print(f"\n• Shepard (Spearman) = {v:.3f} -> préservation globale {lab}")
+        if v < 0.6:
+            print("  ATTENTION : distances entre clusters éloignés peu fiables")
+            print("  -> ne pas interpréter les positions relatives des clusters")
+
+    if "normalized_stress" in m:
+        v = m["normalized_stress"]
+        lab = verdict(v, [0.1, 0.3], ["très bon", "correct", "élevé"])
+        print(f"\n• Normalized stress = {v:.3f} -> écart de distances {lab}")
+        print("  (plus bas = mieux ; complète Shepard sur le global)")
+
+    if "silhouette" in m:
+        v = m["silhouette"]
+        if v < 0:
+            lab = "NÉGATIF — classes qui se chevauchent (points souvent plus"
+            extra = "\n  proches d'une autre classe que de la leur)"
+        elif v < 0.25:
+            lab = "proche de 0 — classes peu séparées / chevauchantes"
+            extra = ""
+        elif v < 0.5:
+            lab = "séparation modérée"
+            extra = ""
+        else:
+            lab = "bonne séparation"
+            extra = ""
+        print(f"\n• Silhouette = {v:.3f} -> {lab}{extra}")
+
+    # ---- lecture croisée simple ---- #
+    print("\n" + "-" * 60)
+    print("Lecture croisée :")
+    tw = m.get("trustworthiness")
+    sil = m.get("silhouette")
+    nh = m.get("neighborhood_hit")
+    if tw is not None and tw > 0.9 and sil is not None and abs(sil) < 0.1:
+        print("  Voisinages locaux fiables MAIS classes non séparées d'ensemble")
+        print("  -> proximité locale exploitable, mais thèmes qui se recouvrent.")
+    if nh is not None and sil is not None and nh > 0.5 and sil < 0.1:
+        print("  NH correct + silhouette ~0 : les voisins immédiats se")
+        print("  ressemblent, mais les classes ne forment pas de blocs compacts.")
+    print("=" * 60)
+
+
+# --------------------------------------------------------------------------- #
+# EXEMPLE
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    demo = {
+        "trustworthiness": 0.92,
+        "continuity": 0.90,
+        "neighborhood_hit": 0.63,
+        "shepard_spearman": 0.41,
+        "normalized_stress": 0.28,
+        "silhouette": -0.082,
+    }
+    diagnostic(demo, n_classes=6)
