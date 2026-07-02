@@ -1,0 +1,129 @@
+"""
+Projection & clustering diagnostic — client-facing report.
+Assumes embeddings are L2-normalized before clustering metrics.
+"""
+
+
+def diagnostic(metrics, n_classes=None, per_class_silhouette=None):
+    """
+    Print a plain-language interpretation of projection quality metrics.
+    All keys are optional; only provided metrics are reported.
+
+    Recognized keys:
+        trustworthiness, continuity, neighborhood_hit,
+        shepard_spearman, normalized_stress,
+        silhouette, davies_bouldin, calinski_harabasz
+    per_class_silhouette : optional {class_label: score} to flag weak classes.
+    """
+    def band(value, thresholds, labels):
+        for t, lab in zip(thresholds, labels):
+            if value < t:
+                return lab
+        return labels[-1]
+
+    m = metrics
+    print("=" * 60)
+    print("PROJECTION QUALITY DIAGNOSTIC")
+    print("=" * 60)
+
+    print("\nStructure preservation (local)")
+    if "trustworthiness" in m:
+        v = m["trustworthiness"]
+        lab = band(v, [0.7, 0.9], ["weak", "acceptable", "excellent"])
+        print(f"  Trustworthiness      {v:6.3f}   {lab}")
+        print("    Share of projected neighbors that are genuine neighbors "
+              "in the original space.")
+    if "continuity" in m:
+        v = m["continuity"]
+        lab = band(v, [0.7, 0.9], ["weak", "acceptable", "excellent"])
+        print(f"  Continuity           {v:6.3f}   {lab}")
+        print("    Share of original neighbors kept close in the projection.")
+
+    print("\nStructure preservation (global)")
+    if "shepard_spearman" in m:
+        v = m["shepard_spearman"]
+        lab = band(v, [0.3, 0.6], ["weak", "moderate", "strong"])
+        print(f"  Shepard (Spearman)   {v:6.3f}   {lab}")
+        print("    Rank agreement between original and projected pairwise "
+              "distances.")
+        if v < 0.6:
+            print("    Note: inter-cluster distances are not reliable; treat "
+                  "relative cluster positions with caution.")
+    if "normalized_stress" in m:
+        v = m["normalized_stress"]
+        print(f"  Normalized stress    {v:6.3f}   (lower is better; "
+              "comparative — no fixed scale)")
+        print("    Magnitude discrepancy between original and projected "
+              "distances. Interpret by comparing across configurations.")
+
+    print("\nClass separation")
+    if "neighborhood_hit" in m:
+        v = m["neighborhood_hit"]
+        lab = band(v, [0.5, 0.8], ["weak", "moderate", "strong"])
+        print(f"  Neighborhood Hit     {v:6.3f}   {lab}")
+        line = ("    Share of each point's nearest neighbors sharing its "
+                "label in the projection.")
+        if n_classes:
+            line += f" Chance level ~{1 / n_classes:.2f} for {n_classes} classes."
+        print(line)
+    if "silhouette" in m:
+        v = m["silhouette"]
+        if v < 0:
+            lab = "negative — classes overlap"
+        elif v < 0.25:
+            lab = "near zero — limited separation"
+        elif v < 0.5:
+            lab = "moderate separation"
+        else:
+            lab = "strong separation"
+        print(f"  Silhouette (cosine)  {v:6.3f}   {lab}")
+        print("    Cohesion within a class relative to the nearest other "
+              "class.")
+    if "davies_bouldin" in m:
+        v = m["davies_bouldin"]
+        print(f"  Davies-Bouldin       {v:6.3f}   (lower is better; "
+              "comparative — no fixed scale)")
+        print("    Average similarity between each class and its closest "
+              "counterpart.")
+    if "calinski_harabasz" in m:
+        v = m["calinski_harabasz"]
+        print(f"  Calinski-Harabasz    {v:9.1f}   (higher is better; "
+              "comparative — no fixed scale)")
+        print("    Ratio of between-class to within-class dispersion.")
+
+    if per_class_silhouette:
+        weak = {c: s for c, s in per_class_silhouette.items() if s < 0.1}
+        if weak:
+            print("\n  Classes with weak cohesion (silhouette < 0.10):")
+            for c, s in sorted(weak.items(), key=lambda kv: kv[1]):
+                print(f"    {str(c):<20} {s:6.3f}")
+
+    print("\n" + "-" * 60)
+    print("Summary")
+    tw, sil, nh = m.get("trustworthiness"), m.get("silhouette"), m.get("neighborhood_hit")
+    if tw is not None and sil is not None and tw > 0.9 and abs(sil) < 0.1:
+        print("  Local neighborhoods are well preserved while classes remain "
+              "poorly separated overall. Local proximity is usable; themes "
+              "overlap in the embedding space.")
+    elif sil is not None and sil >= 0.5:
+        print("  Classes are well separated and the projection is reliable "
+              "for presenting theme structure.")
+    else:
+        print("  Review the class-separation metrics above before drawing "
+              "conclusions about theme boundaries.")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    demo = {
+        "trustworthiness": 0.92,
+        "continuity": 0.90,
+        "neighborhood_hit": 0.63,
+        "shepard_spearman": 0.41,
+        "normalized_stress": 0.28,
+        "silhouette": -0.082,
+        "davies_bouldin": 2.4,
+        "calinski_harabasz": 118.7,
+    }
+    per_class = {"invoices": 0.31, "complaints": -0.05, "support": 0.02, "sales": 0.44}
+    diagnostic(demo, n_classes=6, per_class_silhouette=per_class)
