@@ -1,13 +1,7 @@
-"""
-Projection & clustering diagnostic — client-facing report.
-Assumes embeddings are L2-normalized before clustering metrics.
-"""
-
 
 def diagnostic(metrics, n_classes=None, per_class_silhouette=None):
     """
     Print a plain-language interpretation of projection quality metrics.
-    All keys are optional; only provided metrics are reported.
 
     Recognized keys:
         trustworthiness, continuity, neighborhood_hit,
