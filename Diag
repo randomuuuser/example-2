@@ -1,216 +1,41 @@
-"""
-Projection & clustering diagnostic — client-facing report.
-Assumes embeddings are L2-normalized before clustering metrics.
-"""
+import numpy as np
+import plotly.graph_objects as go
 
+np.random.seed(0)
+n = 30
+classes = np.random.choice(["A", "B", "C"], n)
+x, y = np.random.rand(n), np.random.rand(n)
 
-DEFAULT_THRESHOLDS = {
-    # metric: (lower_band, upper_band) — value < lower = worst tier, etc.
-    "trustworthiness": (0.7, 0.9),
-    "continuity": (0.7, 0.9),
-    "shepard_spearman": (0.3, 0.6),
-    "neighborhood_hit": (0.5, 0.8),
-    "silhouette": (0.25, 0.5),      # near-zero / moderate / strong
-    "weak_silhouette": 0.10,        # per-class flag (single cutoff)
-    "tw_co_divergence": 0.15,       # summary: divergence trigger
-}
+unique_classes = sorted(set(classes))
+palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+color_map = {c: palette[i] for i, c in enumerate(unique_classes)}
 
-# Guardrails: each tunable must stay within a sane range so a user cannot,
-# e.g., call 0.2 "excellent". Bands must also stay ordered (checked below).
-THRESHOLD_BOUNDS = {
-    "trustworthiness": {"lower": (0.5, 0.85), "upper": (0.85, 0.98)},
-    "continuity": {"lower": (0.5, 0.85), "upper": (0.85, 0.98)},
-    "shepard_spearman": {"lower": (0.2, 0.5), "upper": (0.5, 0.8)},
-    "neighborhood_hit": {"lower": (0.3, 0.65), "upper": (0.65, 0.9)},
-    "silhouette": {"lower": (0.1, 0.4), "upper": (0.4, 0.7)},
-    "weak_silhouette": (0.05, 0.3),
-    "tw_co_divergence": (0.1, 0.3),
-}
+fig = go.Figure()
 
+for c in unique_classes:
+    mask = classes == c
+    xi, yi = x[mask], y[mask]
 
-def _validate_thresholds(t):
-    for key, bounds in THRESHOLD_BOUNDS.items():
-        val = t[key]
-        if isinstance(bounds, tuple):  # single cutoff
-            lo, hi = bounds
-            if not lo <= val <= hi:
-                raise ValueError(
-                    f"{key}={val} out of allowed range [{lo}, {hi}]."
-                )
-        else:  # two-band metric
-            low, up = val
-            lo_lo, lo_hi = bounds["lower"]
-            up_lo, up_hi = bounds["upper"]
-            if not lo_lo <= low <= lo_hi:
-                raise ValueError(
-                    f"{key} lower band {low} out of range [{lo_lo}, {lo_hi}]."
-                )
-            if not up_lo <= up <= up_hi:
-                raise ValueError(
-                    f"{key} upper band {up} out of range [{up_lo}, {up_hi}]."
-                )
-            if low >= up:
-                raise ValueError(
-                    f"{key} bands must be ordered: {low} < {up} required."
-                )
+    # Fond coloré : marqueur carré large et semi-transparent
+    fig.add_trace(go.Scatter(
+        x=xi, y=yi, mode="markers",
+        marker=dict(symbol="square", size=26,
+                    color=color_map[c], opacity=0.45,
+                    line=dict(width=0)),
+        name=c, legendgroup=c,
+        hoverinfo="skip", showlegend=True,
+    ))
 
+    # Emoji par-dessus, même legendgroup pour disparaître ensemble
+    fig.add_trace(go.Scatter(
+        x=xi, y=yi, mode="text",
+        text=["📧"] * mask.sum(),
+        textfont=dict(size=16),
+        name=c, legendgroup=c,
+        hovertemplate=f"classe={c}<extra></extra>",
+        showlegend=False,
+    ))
 
-def diagnostic(metrics, n_classes=None, per_class_silhouette=None,
-               thresholds=None):
-    """
-    Print a plain-language interpretation of projection quality metrics.
-    All metric keys are optional; only provided metrics are reported.
-
-    Recognized keys:
-        trustworthiness, continuity, neighborhood_hit,
-        shepard_spearman, normalized_stress,
-        silhouette, davies_bouldin, calinski_harabasz
-    per_class_silhouette : optional {class_label: score} to flag weak classes.
-    thresholds : optional dict overriding any of DEFAULT_THRESHOLDS. Each value
-        is range-checked (see THRESHOLD_BOUNDS) so qualitative labels cannot be
-        assigned to unreasonable cutoffs. Two-band entries must stay ordered.
-    """
-    t = dict(DEFAULT_THRESHOLDS)
-    if thresholds:
-        t.update(thresholds)
-    _validate_thresholds(t)
-
-    def band(value, key, labels):
-        low, up = t[key]
-        return labels[0] if value < low else labels[1] if value < up else labels[2]
-
-    m = metrics
-    print("=" * 60)
-    print("PROJECTION QUALITY DIAGNOSTIC")
-    print("=" * 60)
-
-    print("\nStructure preservation (local)")
-    if "trustworthiness" in m:
-        v = m["trustworthiness"]
-        lab = band(v, "trustworthiness", ["weak", "acceptable", "excellent"])
-        print(f"  Trustworthiness      {v:6.3f}   {lab}")
-        print("    Share of projected neighbors that are genuine neighbors "
-              "in the original space.")
-    if "continuity" in m:
-        v = m["continuity"]
-        lab = band(v, "continuity", ["weak", "acceptable", "excellent"])
-        print(f"  Continuity           {v:6.3f}   {lab}")
-        print("    Share of original neighbors kept close in the projection.")
-
-    print("\nStructure preservation (global)")
-    if "shepard_spearman" in m:
-        v = m["shepard_spearman"]
-        lab = band(v, "shepard_spearman", ["weak", "moderate", "strong"])
-        print(f"  Shepard (Spearman)   {v:6.3f}   {lab}")
-        print("    Rank agreement between original and projected pairwise "
-              "distances.")
-        if v < t["shepard_spearman"][1]:
-            print("    Note: inter-cluster distances are not reliable; treat "
-                  "relative cluster positions with caution.")
-    if "normalized_stress" in m:
-        v = m["normalized_stress"]
-        print(f"  Normalized stress    {v:6.3f}   (lower is better; "
-              "comparative — no fixed scale)")
-        print("    Magnitude discrepancy between original and projected "
-              "distances. Interpret by comparing across configurations.")
-
-    print("\nClass separation")
-    if "neighborhood_hit" in m:
-        v = m["neighborhood_hit"]
-        lab = band(v, "neighborhood_hit", ["weak", "moderate", "strong"])
-        print(f"  Neighborhood Hit     {v:6.3f}   {lab}")
-        line = ("    Share of each point's nearest neighbors sharing its "
-                "label in the projection.")
-        if n_classes:
-            line += f" Chance level ~{1 / n_classes:.2f} for {n_classes} classes."
-        print(line)
-    if "silhouette" in m:
-        v = m["silhouette"]
-        near, strong = t["silhouette"]
-        if v < 0:
-            lab = "negative — classes overlap"
-        elif v < near:
-            lab = "near zero — limited separation"
-        elif v < strong:
-            lab = "moderate separation"
-        else:
-            lab = "strong separation"
-        print(f"  Silhouette (cosine)  {v:6.3f}   {lab}")
-        print("    Cohesion within a class relative to the nearest other "
-              "class.")
-    if "davies_bouldin" in m:
-        v = m["davies_bouldin"]
-        print(f"  Davies-Bouldin       {v:6.3f}   (lower is better; "
-              "comparative — no fixed scale)")
-        print("    Average similarity between each class and its closest "
-              "counterpart.")
-    if "calinski_harabasz" in m:
-        v = m["calinski_harabasz"]
-        print(f"  Calinski-Harabasz    {v:9.1f}   (higher is better; "
-              "comparative — no fixed scale)")
-        print("    Ratio of between-class to within-class dispersion.")
-
-    if per_class_silhouette:
-        thr = t["weak_silhouette"]
-        weak = {c: s for c, s in per_class_silhouette.items() if s < thr}
-        if weak:
-            print(f"\n  Classes with weak cohesion (silhouette < {thr:.2f}):")
-            for c, s in sorted(weak.items(), key=lambda kv: kv[1]):
-                print(f"    {str(c):<20} {s:6.3f}")
-
-    print("\n" + "-" * 60)
-    print("Summary")
-
-    tw = m.get("trustworthiness")
-    co = m.get("continuity")
-    sil = m.get("silhouette")
-
-    # Axis 1: is the projection itself reliable?
-    proj_reliable = tw is not None and tw >= t["trustworthiness"][1]
-    proj_unreliable = tw is not None and tw < t["trustworthiness"][0]
-
-    # Axis 2: are classes separated?
-    well_separated = sil is not None and sil >= t["silhouette"][1]
-    not_separated = sil is not None and sil < t["weak_silhouette"]
-
-    if tw is not None and co is not None and abs(tw - co) >= t["tw_co_divergence"]:
-        print("  Trustworthiness and continuity diverge, indicating uneven "
-              "distortion: one direction of the neighborhood mapping is "
-              "preserved better than the other. Interpret local structure "
-              "with care.")
-    elif proj_unreliable:
-        print("  The projection does not preserve local structure reliably. "
-              "Class-separation metrics on the projection should not be used "
-              "to draw conclusions; rely on high-dimensional metrics instead.")
-    elif proj_reliable and well_separated:
-        print("  The projection is reliable and classes are well separated. "
-              "The visualization can be presented as representative of theme "
-              "structure.")
-    elif proj_reliable and not_separated:
-        print("  Local neighborhoods are well preserved while classes remain "
-              "poorly separated overall. Local proximity is usable; themes "
-              "overlap in the embedding space.")
-    elif well_separated:
-        print("  Classes are well separated. Projection fidelity is not "
-              "confirmed; verify trustworthiness before relying on the "
-              "visualization.")
-    else:
-        print("  Signals are mixed. Review the metrics above; final "
-              "interpretation of theme boundaries requires manual inspection.")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    demo = {
-        "trustworthiness": 0.92,
-        "continuity": 0.90,
-        "neighborhood_hit": 0.63,
-        "shepard_spearman": 0.41,
-        "normalized_stress": 0.28,
-        "silhouette": -0.082,
-        "davies_bouldin": 2.4,
-        "calinski_harabasz": 118.7,
-    }
-    per_class = {"invoices": 0.31, "complaints": -0.05, "support": 0.02, "sales": 0.44}
-    diagnostic(demo, n_classes=6, per_class_silhouette=per_class)
-
+fig.update_layout(title="Emails par classe", legend_title="Classe",
+                  width=700, height=500)
+fig.show()
