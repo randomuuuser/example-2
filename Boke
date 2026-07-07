@@ -1,42 +1,100 @@
-import numpy as np
-from bokeh.plotting import figure, show
-from bokeh.models import ColumnDataSource
-from bokeh.palettes import Category10
+import json
+import pandas as pd
+from pydantic import BaseModel
+from openai import OpenAI
 
-# --- Données exemple ---
-np.random.seed(0)
-n = 30
-classes = np.random.choice(["A", "B", "C"], n)
-x = np.random.rand(n)
-y = np.random.rand(n)
+from deepeval.models import DeepEvalBaseLLM
+from deepeval.metrics import SummarizationMetric, GEval
+from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
-unique_classes = sorted(set(classes))
-palette = Category10[max(3, len(unique_classes))]
-color_map = {c: palette[i] for i, c in enumerate(unique_classes)}
 
-p = figure(width=700, height=500, title="Emails par classe",
-           tools="pan,wheel_zoom,box_zoom,reset,hover",
-           tooltips=[("classe", "@cls")])
+# --- 1. Juge custom vLLM (endpoint OpenAI-compatible, avec support schema) ---
+class VLLMJudge(DeepEvalBaseLLM):
+    def __init__(
+        self,
+        model_name="google/gemma-2-9b-it",
+        base_url="http://localhost:8000/v1",
+        api_key="EMPTY",
+    ):
+        self.model_name = model_name
+        self.client = OpenAI(base_url=base_url, api_key=api_key)
 
-for c in unique_classes:
-    mask = classes == c
-    source = ColumnDataSource(dict(
-        x=x[mask], y=y[mask],
-        cls=[c] * mask.sum(),
-        emoji=["📧"] * mask.sum(),
-    ))
+    def load_model(self):
+        return self.client
 
-    # Rectangle coloré en fond (distinction de classe)
-    p.rect(x="x", y="y", width=0.04, height=0.04,
-           color=color_map[c], alpha=0.45, source=source,
-           legend_label=c)
+    def generate(self, prompt: str, schema: BaseModel = None):
+        if schema is not None:
+            # guided decoding via vLLM : force une sortie JSON conforme au schema
+            resp = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                extra_body={"guided_json": schema.model_json_schema()},
+            )
+            content = resp.choices[0].message.content
+            return schema(**json.loads(content))
+        else:
+            resp = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+            )
+            return resp.choices[0].message.content
 
-    # Emoji par-dessus
-    p.text(x="x", y="y", text="emoji", source=source,
-           text_font_size="14px", text_align="center",
-           text_baseline="middle")
+    async def a_generate(self, prompt: str, schema: BaseModel = None):
+        # mode séquentiel : on réutilise la version sync
+        return self.generate(prompt, schema)
 
-p.legend.click_policy = "hide"
-p.legend.title = "Classe"
+    def get_model_name(self):
+        return self.model_name
 
-show(p)
+
+judge = VLLMJudge()
+
+
+# --- 2. Métriques ---
+summarization = SummarizationMetric(
+    threshold=0.5,
+    model=judge,
+    n=5,  # nombre de questions d'évaluation générées
+)
+
+faithfulness = GEval(
+    name="Faithfulness",
+    criteria=(
+        "Determine whether the summary contains only information supported by "
+        "the source text, with no contradictions or fabricated facts."
+    ),
+    evaluation_params=[
+        LLMTestCaseParams.INPUT,
+        LLMTestCaseParams.ACTUAL_OUTPUT,
+    ],
+    model=judge,
+    threshold=0.7,
+)
+
+
+# --- 3. Boucle séquentielle sur le dataset ---
+df = email_dataset  # ou pd.read_csv(...)
+
+results = []
+for idx, row in df.iterrows():
+    test_case = LLMTestCase(
+        input=row["text_X_cleaned"],
+        actual_output=row["summary"],
+    )
+
+    summarization.measure(test_case)
+    faithfulness.measure(test_case)
+
+    results.append({
+        "index": idx,
+        "summarization_score": summarization.score,
+        "summarization_reason": summarization.reason,
+        "faithfulness_score": faithfulness.score,
+        "faithfulness_reason": faithfulness.reason,
+    })
+
+results_df = pd.DataFrame(results)
+print(results_df[["index", "summarization_score", "faithfulness_score"]])
+results_df.to_csv("summary_eval_results.csv", index=False)
