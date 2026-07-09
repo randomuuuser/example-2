@@ -1,33 +1,19 @@
 """
-Benchmark de méthodes de réduction de dimension pour un input vecteur donné.
+Benchmark of dimensionality reduction methods for a given input of embeddings.
 
-Entrée  : X, un array (n_samples, n_features) d'embeddings.
-Sortie  : un DataFrame `métriques (lignes) x méthodes (colonnes)`.
+Input : X, an array (n_samples, n_features).
+Output: a DataFrame `metrics (rows) x methods (columns)`.
 
-Méthodes sélectionnées (top par catégorie) :
-  - PCA        : linéaire globale (baseline déterministe)
-  - Isomap     : manifold classique (distances géodésiques)
-  - t-SNE      : locale moderne, gold-standard clusters
-  - UMAP       : locale moderne, standard rapide
-  - TriMap     : orientée structure globale (triplets)
-  - PaCMAP     : compromis local + global
-
-Métriques :
-  - trustworthiness      : faux voisins (local),        [0,1] haut = mieux
-  - continuity           : voisins manquants (local),   [0,1] haut = mieux
-  - knn_preservation     : recouvrement des k-NN,        [0,1] haut = mieux
-  - shepard_spearman     : corrélation de rang des distances (global), [-1,1] haut = mieux
-  - normalized_stress    : préservation des distances (global), bas = mieux
-  - runtime_s            : temps d'exécution en secondes, bas = mieux
-
-Style : fonctions simples, pas de classes, dépendances minimales.
+Selected methods (top per category):
+  - PCA     : linear, global baseline
+  - Isomap  : classic manifold
+  - t-SNE   : modern local, cluster gold-standard
+  - UMAP    : modern local, fast standard
+  - TriMap  : global-structure oriented
+  - PaCMAP  : local + global trade-off
 """
 
-import os
 import time
-import warnings
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -38,15 +24,16 @@ from sklearn.preprocessing import normalize
 from scipy.spatial.distance import pdist
 from scipy.stats import spearmanr
 
+import warnings
 warnings.filterwarnings("ignore")
 
 
 # --------------------------------------------------------------------------- #
-# 1. Méthodes de réduction : chacune prend (X, n_components) -> embedding 2D   #
+# Reduction methods: each takes (X, n_components) -> 2D embedding              #
 # --------------------------------------------------------------------------- #
 
-def reduce_pca(X, n_components=2, random_state=42):
-    return PCA(n_components=n_components, random_state=random_state).fit_transform(X)
+def reduce_pca(X, n_components=2):
+    return PCA(n_components=n_components, random_state=42).fit_transform(X)
 
 
 def reduce_isomap(X, n_components=2, n_neighbors=15):
@@ -54,27 +41,18 @@ def reduce_isomap(X, n_components=2, n_neighbors=15):
     return Isomap(n_components=n_components, n_neighbors=n_neighbors).fit_transform(X)
 
 
-def reduce_tsne(X, n_components=2, random_state=42):
-    # init="pca" : essentiel pour préserver un minimum de structure globale
+def reduce_tsne(X, n_components=2):
     perplexity = min(30, max(5, (len(X) - 1) // 3))
-    return TSNE(
-        n_components=n_components,
-        init="pca",
-        perplexity=perplexity,
-        random_state=random_state,
-    ).fit_transform(X)
+    # init="pca" preserves some global structure
+    return TSNE(n_components=n_components, init="pca",
+                perplexity=perplexity, random_state=42).fit_transform(X)
 
 
-def reduce_umap(X, n_components=2, n_neighbors=15, random_state=42, metric="cosine"):
+def reduce_umap(X, n_components=2, metric="cosine"):
     import umap
-    n_neighbors = min(n_neighbors, len(X) - 1)
-    return umap.UMAP(
-        n_components=n_components,
-        n_neighbors=n_neighbors,
-        init="spectral",
-        random_state=random_state,
-        metric=metric,
-    ).fit_transform(X)
+    n_neighbors = min(15, len(X) - 1)
+    return umap.UMAP(n_components=n_components, n_neighbors=n_neighbors,
+                     metric=metric, random_state=42).fit_transform(X)
 
 
 def reduce_trimap(X, n_components=2, metric="cosine"):
@@ -82,20 +60,14 @@ def reduce_trimap(X, n_components=2, metric="cosine"):
     return trimap.TRIMAP(n_dims=n_components, distance=metric).fit_transform(X.astype(np.float32))
 
 
-def reduce_pacmap(X, n_components=2, n_neighbors=None, random_state=42, metric="cosine"):
+def reduce_pacmap(X, n_components=2, metric="cosine"):
     import pacmap
-    # PaCMAP nomme le paramètre "distance" et emploie "angular" pour le cosinus.
+    # PaCMAP uses "angular" for the cosine distance
     distance = {"cosine": "angular"}.get(metric, metric)
-    reducer = pacmap.PaCMAP(
-        n_components=n_components,
-        n_neighbors=n_neighbors,       # None => heuristique interne
-        random_state=random_state,
-        distance=distance,
-    )
+    reducer = pacmap.PaCMAP(n_components=n_components, distance=distance, random_state=42)
     return reducer.fit_transform(X, init="pca")
 
 
-# Registre : nom -> fonction. Ajouter/retirer une ligne suffit à modifier le run.
 METHODS = {
     "PCA": reduce_pca,
     "Isomap": reduce_isomap,
@@ -107,7 +79,7 @@ METHODS = {
 
 
 # --------------------------------------------------------------------------- #
-# 2. Métriques : chacune prend (X_high, X_low[, k]) -> float                   #
+# Metrics: each takes (X_high, X_low[, k]) -> float                           #
 # --------------------------------------------------------------------------- #
 
 def metric_trustworthiness(X_high, X_low, k=10):
@@ -116,7 +88,7 @@ def metric_trustworthiness(X_high, X_low, k=10):
 
 
 def metric_continuity(X_high, X_low, k=10):
-    # Continuity = trustworthiness en inversant les rôles des deux espaces.
+    # Continuity = trustworthiness with the two spaces swapped
     k = min(k, len(X_high) - 1)
     return float(trustworthiness(X_low, X_high, n_neighbors=k))
 
@@ -124,8 +96,7 @@ def metric_continuity(X_high, X_low, k=10):
 def _knn_indices(X, k):
     k = min(k, len(X) - 1)
     nn = NearestNeighbors(n_neighbors=k + 1).fit(X)
-    idx = nn.kneighbors(X, return_distance=False)[:, 1:]  # exclut le point lui-même
-    return idx
+    return nn.kneighbors(X, return_distance=False)[:, 1:]  # drop the point itself
 
 
 def metric_knn_preservation(X_high, X_low, k=10):
@@ -135,220 +106,83 @@ def metric_knn_preservation(X_high, X_low, k=10):
     return float(np.mean(overlap) / hi.shape[1])
 
 
-def metric_shepard_spearman(X_high, X_low, sample=2000, random_state=42):
-    # Sous-échantillonnage des paires si trop de points (pdist est O(n^2)).
-    rng = np.random.default_rng(random_state)
-    if len(X_high) > sample:
-        sel = rng.choice(len(X_high), sample, replace=False)
-        X_high, X_low = X_high[sel], X_low[sel]
-    d_high = pdist(X_high)
-    d_low = pdist(X_low)
-    rho, _ = spearmanr(d_high, d_low)
+def metric_shepard_spearman(X_high, X_low):
+    # Rank correlation of pairwise distances (global structure)
+    rho, _ = spearmanr(pdist(X_high), pdist(X_low))
     return float(rho)
 
 
-def metric_normalized_stress(X_high, X_low, sample=2000, random_state=42):
-    rng = np.random.default_rng(random_state)
-    if len(X_high) > sample:
-        sel = rng.choice(len(X_high), sample, replace=False)
-        X_high, X_low = X_high[sel], X_low[sel]
-    d_high = pdist(X_high)
-    d_low = pdist(X_low)
-    # Mise à l'échelle optimale de d_low pour ne pas pénaliser un simple facteur.
+def metric_normalized_stress(X_high, X_low):
+    d_high, d_low = pdist(X_high), pdist(X_low)
+    # Optimal scaling of d_low so a pure scale factor is not penalized
     alpha = np.sum(d_high * d_low) / np.sum(d_low ** 2)
-    num = np.sum((d_high - alpha * d_low) ** 2)
-    den = np.sum(d_high ** 2)
-    return float(num / den)
+    return float(np.sum((d_high - alpha * d_low) ** 2) / np.sum(d_high ** 2))
 
 
 METRICS = {
-    "trustworthiness": metric_trustworthiness,
-    "continuity": metric_continuity,
-    "knn_preservation": metric_knn_preservation,
-    "shepard_spearman": metric_shepard_spearman,
-    "normalized_stress": metric_normalized_stress,
-}
-
-# Sens d'optimisation : utile pour l'interprétation / un tri éventuel.
-METRIC_DIRECTION = {
-    "trustworthiness": "higher_better",
-    "continuity": "higher_better",
-    "knn_preservation": "higher_better",
-    "shepard_spearman": "higher_better",
-    "normalized_stress": "lower_better",
-    "runtime_s": "lower_better",
+    "trustworthiness": metric_trustworthiness,     # higher is better
+    "continuity": metric_continuity,               # higher is better
+    "knn_preservation": metric_knn_preservation,   # higher is better
+    "shepard_spearman": metric_shepard_spearman,   # higher is better
+    "normalized_stress": metric_normalized_stress, # lower is better
 }
 
 
 # --------------------------------------------------------------------------- #
-# 3. Orchestration                                                            #
+# Benchmark                                                                   #
 # --------------------------------------------------------------------------- #
 
-def run_one_method(name, fn, X, n_components=2, k=10, metric="cosine"):
-    """Applique une méthode, mesure le temps, calcule toutes les métriques.
-
-    `metric` n'est transmis qu'aux méthodes qui l'acceptent (UMAP, TriMap,
-    PaCMAP) ; PCA / Isomap / t-SNE l'ignorent proprement.
+def benchmark(X, k=10, metric="cosine", l2_normalize=True, pca_prereduce=50):
     """
-    t0 = time.perf_counter()
-    kwargs = {"n_components": n_components}
-    if "metric" in fn.__code__.co_varnames:
-        kwargs["metric"] = metric
-    try:
-        X_low = fn(X, **kwargs)
-    except Exception as e:
-        print(f"[{name}] échec : {e}")
-        scores = {m: np.nan for m in METRICS}
-        scores["runtime_s"] = np.nan
-        return scores
-    runtime = time.perf_counter() - t0
-
-    scores = {}
-    for metric_name, metric_fn in METRICS.items():
-        try:
-            scores[metric_name] = metric_fn(X, X_low, k) if "k" in metric_fn.__code__.co_varnames \
-                else metric_fn(X, X_low)
-        except Exception as e:
-            print(f"[{name}/{metric_name}] échec : {e}")
-            scores[metric_name] = np.nan
-    scores["runtime_s"] = runtime
-    return scores
-
-
-def prereduce_pca(X, n_dims=50, random_state=42):
-    """Pré-réduction PCA optionnelle avant les méthodes non-linéaires.
-
-    Levier de latence SANS perte de qualité : sur des embeddings à plusieurs
-    centaines/milliers de dimensions, projeter à ~50 dims accélère fortement le
-    calcul du kNN (UMAP/TriMap/PaCMAP/Isomap) tout en retirant surtout du bruit.
-    C'est le standard des pipelines single-cell. N'a aucun effet si n_features
-    est déjà <= n_dims.
-    """
-    if X.shape[1] <= n_dims:
-        return X
-    return PCA(n_components=n_dims, random_state=random_state).fit_transform(X)
-
-
-def _run_method_worker(args):
-    """Worker exécuté dans un processus séparé.
-
-    Bride numba/BLAS à `threads_per_job` cœurs AVANT tout import lourd, pour
-    éviter la sur-souscription CPU quand plusieurs méthodes tournent en même
-    temps. Les projections restent identiques au run séquentiel : on ne change
-    que le nombre de threads, jamais les hyperparamètres.
-    """
-    name, X, n_components, k, metric, threads_per_job = args
-    os.environ["NUMBA_NUM_THREADS"] = str(threads_per_job)
-    os.environ["OMP_NUM_THREADS"] = str(threads_per_job)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(threads_per_job)
-    os.environ["MKL_NUM_THREADS"] = str(threads_per_job)
-    return name, run_one_method(name, METHODS[name], X, n_components, k, metric)
-
-
-def benchmark(X, n_components=2, k=10, methods=None, metric="cosine",
-              l2_normalize=True, pca_prereduce=50, parallel=True, max_workers=None):
-    """
-    Benchmark complet.
+    Run every method and score it with every metric.
 
     Args:
-        X            : array (n_samples, n_features) d'embeddings.
-        n_components : dimension de sortie (2 pour la visualisation).
-        k            : voisinage pour les métriques locales.
-        methods      : sous-ensemble de noms (défaut = tous).
-        metric       : distance passée aux méthodes qui la supportent
-                       (UMAP, TriMap, PaCMAP). Défaut "cosine".
-        l2_normalize : si True, chaque vecteur est ramené à une norme L2 unité
-                       avant réduction.
-        pca_prereduce: si int > 0, pré-réduit X à ce nombre de dims via PCA avant
-                       les méthodes non-linéaires (accélère sans perte de qualité).
-                       None ou 0 pour désactiver.
-        parallel     : si True, exécute les méthodes en processus séparés avec
-                       bridage des cœurs. Les projections sont identiques au
-                       séquentiel ; seul le mur-total baisse. NB : dans ce mode,
-                       les `runtime_s` individuels ne sont pas comparables au
-                       séquentiel (moins de cœurs par méthode + concurrence).
-        max_workers  : nb de processus (défaut = min(nb_méthodes, nb_cpu)).
+        X            : array (n_samples, n_features).
+        k            : neighborhood size for local metrics.
+        metric       : distance for methods that support it (UMAP/TriMap/PaCMAP).
+        l2_normalize : scale each vector to unit L2 norm.
+        pca_prereduce: reduce X to this many dims with PCA before the non-linear
+                       methods. Speeds things up by removing noise, with
+                       negligible quality impact. Set to None to disable.
 
     Returns:
-        DataFrame indexé par métrique, colonnes = méthodes.
-
-    Trade-off latence/qualité :
-      - parallel=True  : réordonne le calcul sans jamais toucher aux projections
-        ni aux hyperparamètres. Qualité STRICTEMENT préservée. N'accélère que
-        s'il y a plusieurs cœurs libres (aucun gain sur une machine 1-cœur).
-      - pca_prereduce  : retire surtout du bruit avant les méthodes non-linéaires.
-        Effet sur la qualité neutre-à-POSITIF en pratique (standard single-cell),
-        mais pas strictement identique : la projection change marginalement.
-        Mettre None si tu exiges une projection rigoureusement inchangée.
-      Les hyperparamètres de convergence (n_epochs, random_state...) restent
-      intacts dans tous les cas : aucun levier ne dégrade la convergence.
+        DataFrame indexed by metric, columns = methods.
     """
     X = np.asarray(X, dtype=np.float64)
     if l2_normalize:
-        X = normalize(X, norm="l2")   # chaque vecteur ramené à une norme unité
-    if pca_prereduce:
-        X = prereduce_pca(X, n_dims=pca_prereduce)
-    selected = methods or list(METHODS.keys())
+        X = normalize(X, norm="l2")
+    if pca_prereduce and X.shape[1] > pca_prereduce:
+        X = PCA(n_components=pca_prereduce, random_state=42).fit_transform(X)
 
     results = {}
-    use_parallel = parallel and len(selected) > 1
-    if use_parallel:
-        n_cpu = os.cpu_count() or 4
-        workers = max_workers or min(len(selected), n_cpu)
-        threads_per_job = max(1, n_cpu // workers)
-        tasks = [(name, X, n_components, k, metric, threads_per_job)
-                 for name in selected]
-        print(f"[parallèle] {workers} processus x {threads_per_job} threads/job")
-        # 'spawn' : processus vierges, évite le crash fork()+OpenMP quand le
-        # parent a déjà initialisé numba/OpenMP.
-        ctx = mp.get_context("spawn")
-        try:
-            with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
-                for name, scores in ex.map(_run_method_worker, tasks):
-                    print(f"-> {name} terminé")
-                    results[name] = scores
-        except Exception as e:
-            # Fallback : appel hors `if __name__=='__main__'`, env sans spawn, etc.
-            print(f"[parallèle indisponible : {type(e).__name__}] bascule en séquentiel")
-            results = {}
-            use_parallel = False
+    for name, fn in METHODS.items():
+        print(f"-> {name}")
+        t0 = time.perf_counter()
+        # Pass the metric only to methods that accept it
+        kwargs = {"metric": metric} if "metric" in fn.__code__.co_varnames else {}
+        X_low = fn(X, **kwargs)
+        runtime = time.perf_counter() - t0
 
-    if not use_parallel:
-        for name in selected:
-            print(f"-> {name} ...")
-            results[name] = run_one_method(name, METHODS[name], X,
-                                           n_components, k, metric)
+        scores = {}
+        for m_name, m_fn in METRICS.items():
+            scores[m_name] = m_fn(X, X_low, k) if "k" in m_fn.__code__.co_varnames \
+                else m_fn(X, X_low)
+        scores["runtime_s"] = runtime
+        results[name] = scores
 
-    df = pd.DataFrame(results)[selected]   # conserve l'ordre des méthodes
-    # Ordre de lignes stable : métriques puis runtime.
-    row_order = list(METRICS.keys()) + ["runtime_s"]
-    df = df.reindex(row_order)
+    df = pd.DataFrame(results).reindex(list(METRICS) + ["runtime_s"])
     df.index.name = "metric"
     return df.round(4)
 
 
-# --------------------------------------------------------------------------- #
-# 4. Exemple d'utilisation                                                    #
-# --------------------------------------------------------------------------- #
-
 if __name__ == "__main__":
     from sklearn.datasets import make_blobs
 
-    # Remplacer ce bloc par tes propres embeddings :  X = np.load("embeddings.npy")
+    # Replace with your own embeddings:  X = np.load("my_embeddings.npy")
     X, _ = make_blobs(n_samples=1000, n_features=128, centers=8, random_state=0)
 
-    # Mode rapide (défaut) : parallèle + PCA pre-reduce, qualité préservée.
-    df = benchmark(X, n_components=2, k=10, metric="cosine",
-                   l2_normalize=True, pca_prereduce=50, parallel=True)
-    print("\n=== Résultats (métriques x méthodes) ===")
+    df = benchmark(X)
+    print("\n=== Results (metrics x methods) ===")
     print(df.to_string())
-
     df.to_csv("dr_benchmark_results.csv")
-    print("\nSauvegardé -> dr_benchmark_results.csv")
-
-
-
-
-
-
-
+    print("\nSaved -> dr_benchmark_results.csv")
