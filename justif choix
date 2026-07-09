@@ -1,0 +1,164 @@
+# Choix des méthodes de réduction de dimension — justification
+
+Ce document explique **pourquoi** le benchmark retient sept méthodes (PCA, Isomap,
+t-SNE, UMAP, TriMap, PaCMAP, densMAP) et **pourquoi** il en écarte d'autres. Il
+sert de référence pour justifier la sélection et pour savoir quand la remettre en
+cause.
+
+---
+
+## 1. Le principe de sélection
+
+Le critère directeur n'est pas « prendre les méthodes les plus connues », mais
+**couvrir chaque famille algorithmique par son meilleur représentant**, le long
+de l'axe qui compte pour la visualisation 2D : la préservation de la structure
+**locale** (voisinages, clusters) contre la structure **globale** (positions
+relatives, distances à grande échelle).
+
+Trois contraintes pratiques complètent ce critère :
+
+1. **API homogène** — chaque méthode expose un `fit_transform` comparable, ce qui
+   permet de les évaluer sur les *mêmes* métriques.
+2. **Installation sans friction** — disponibles via pip, sans service externe ni
+   dépendance lourde.
+3. **Pertinence pour le cas d'usage** — exploration et clustering d'embeddings de
+   texte (emails), en clusters plutôt discrets.
+
+---
+
+## 2. Les méthodes retenues, une par famille
+
+| Famille | Retenu | Rôle dans le benchmark |
+|---|---|---|
+| Linéaire globale | **PCA** | Baseline déterministe, sans hyperparamètre ; borne de référence pour la structure globale et la vitesse. |
+| Manifold classique | **Isomap** | Représentant historique du manifold learning (distances géodésiques) ; montre les limites des méthodes pré-2008. |
+| Locale moderne | **t-SNE** | Gold-standard de la séparation de clusters ; meilleure préservation locale. |
+| Locale moderne | **UMAP** | Standard actuel ; bon compromis local + vitesse, très répandu en single-cell et NLP. |
+| Local + global | **TriMap** | Orienté structure globale via contraintes de triplets. |
+| Local + global | **PaCMAP** | Conçu pour préserver local ET global simultanément ; meilleur compromis documenté. |
+| Densité | **densMAP** | Préserve la densité locale ; révèle une structure invisible aux autres. |
+
+### Justification détaillée
+
+**PCA — la baseline incontournable.** Déterministe, sans hyperparamètre,
+quasi-instantanée. Elle ne capture aucune structure non-linéaire, ce qui est
+précisément l'intérêt : elle fixe le plancher que les méthodes non-linéaires
+doivent dépasser en local, et le plafond difficile à battre en préservation
+globale des distances. Sert aussi d'étape de pré-réduction et d'initialisation
+pour les autres.
+
+**Isomap — le témoin du manifold learning classique.** Représente toute une
+génération de méthodes (LLE, Laplacian Eigenmaps, Kernel PCA) fondées sur la
+préservation de distances géodésiques ou locales. Un seul suffit à illustrer le
+comportement de la famille : ces méthodes se dégradent quand les distances se
+concentrent en haute dimension, ce que le benchmark rend visible.
+
+**t-SNE et UMAP — les deux faces de la famille locale moderne.** On en garde
+*deux* car elles incarnent le même objectif (préservation de voisinage) avec des
+compromis différents : t-SNE maximise la séparation de clusters mais sacrifie le
+global ; UMAP est un peu moins tranché en local mais plus rapide et légèrement
+meilleur en global. Les comparer entre elles est instructif.
+
+**TriMap et PaCMAP — la famille local+global.** Ce sont les réponses récentes au
+défaut commun de t-SNE/UMAP (mauvaise structure globale). TriMap y parvient via
+des triplets et une initialisation PCA ; PaCMAP via trois types de paires avec
+ajustement dynamique. PaCMAP est le meilleur compromis documenté sur les deux
+axes, et le plus robuste au préprocessing.
+
+**densMAP — la famille densité.** Ajouté explicitement parce que les six autres
+sont aveugles à la densité locale. densMAP préserve l'information « cette région
+est dense / clairsemée », ce qui peut révéler une hétérogénéité de sous-population
+que t-SNE et UMAP écrasent. Il a fallu ajouter une métrique dédiée
+(`density_preservation`) pour que sa contribution soit mesurable : sans elle, il
+apparaîtrait à tort comme un simple « UMAP plus lent ».
+
+---
+
+## 3. Les méthodes écartées, et pourquoi
+
+### 3.1 Écartées car redondantes (même famille, représentant déjà pris)
+
+| Méthode | Famille | Raison de l'exclusion |
+|---|---|---|
+| LLE | Manifold classique | Même famille qu'Isomap ; pas de gain de couverture. |
+| Laplacian Eigenmaps | Manifold classique | Idem ; sert surtout d'initialisation interne à UMAP. |
+| Kernel PCA | Manifold classique | Non-linéarité dépendante du choix de kernel ; peu adapté à la viz générique. |
+| MDS (métrique/non-métrique) | Distance-based | Objectif proche de PCA/Isomap en global, coût O(N²) prohibitif. |
+
+**Risque de cette exclusion : faible.** On perd de la variété au sein d'une
+famille déjà représentée, pas une capacité nouvelle. Isomap capture le
+comportement type de cette famille.
+
+### 3.2 Écartées car ce sont des variantes de vitesse, pas de qualité
+
+| Méthode | Équivalent retenu | Raison |
+|---|---|---|
+| FIt-SNE, openTSNE, Barnes-Hut t-SNE | t-SNE | Mêmes projections, seulement plus rapides à grande échelle. |
+| LargeVis | UMAP | Précurseur d'UMAP, même famille, sans avantage de qualité. |
+| h-NNE | UMAP/PaCMAP | Très rapide (optimization-free) mais n'apporte pas de qualité nouvelle. |
+
+**Risque de cette exclusion : nul sur la qualité.** Ces méthodes ne changent que
+la vitesse ou la scalabilité. Elles deviennent pertinentes **le jour où la
+latence sur de gros volumes devient bloquante** — notamment h-NNE et FIt-SNE.
+À réintroduire alors comme options de performance, pas pour améliorer la
+projection.
+
+### 3.3 Écartées car elles optimisent un objectif hors périmètre
+
+C'est ici que se situe le **vrai risque** de la sélection.
+
+| Méthode | Objectif spécifique | Quand elle devient indispensable |
+|---|---|---|
+| **PHATE** | Préservation des trajectoires / transitions continues | Données à structure de continuum (développement cellulaire, séries progressives). Sans objet pour des clusters discrets. |
+| **Parametric UMAP** | Projection inductive (embedder de nouveaux points sans recalcul) | Données en flux, besoin de projeter du nouveau en production. |
+| Autoencodeurs / VAE | Représentation apprise | Rarement bons pour la viz ; ne préservent pas bien local + global simultanément. |
+
+**Risque de ces exclusions : réel mais conditionnel.** PHATE et Parametric UMAP
+ne sont pas « moins bons » — ils répondent à des besoins que le benchmark actuel
+ne mesure pas. Les écarter est justifié **tant que** :
+
+- tes données sont en clusters discrets et non en continuum (→ PHATE inutile) ;
+- tu projettes un jeu figé et non un flux (→ Parametric UMAP inutile).
+
+Si l'une de ces hypothèses tombe, la méthode correspondante doit être réintégrée.
+
+---
+
+## 4. Prend-on le risque de sacrifier une famille ou une meilleure qualité ?
+
+**Réponse courte : non pour ton cas d'usage, sous réserve de deux angles morts
+assumés.**
+
+- **Familles couvertes** : linéaire, manifold classique, locale moderne,
+  local+global, densité. L'axe local↔global — le plus déterminant pour la
+  visualisation — est couvert de bout en bout.
+- **Angles morts assumés** : les **trajectoires** (PHATE) et la **projection
+  inductive** (Parametric UMAP). Ce ne sont pas des oublis mais des choix : ces
+  objectifs sont hors périmètre pour de l'exploration de clusters d'emails figés.
+- **Qualité** : le risque de « passer à côté d'une meilleure projection » n'existe
+  que pour un objectif précis non mesuré. Sur l'axe local↔global, la sélection
+  contient les meilleurs représentants connus ; il n'y a pas de méthode cachée
+  qui ferait strictement mieux sur ces critères.
+
+**Le point de méthode à retenir** : un benchmark ne peut départager les méthodes
+que sur les métriques qu'il contient. La sélection actuelle mesure correctement
+le local, le global et la densité. Elle ne mesure ni les trajectoires ni la
+capacité inductive — donc elle ne peut ni récompenser ni recommander une méthode
+qui n'exceller que sur ces axes-là. Tant que ces axes ne comptent pas pour tes
+données, la sélection est complète.
+
+---
+
+## 5. Résumé décisionnel
+
+| Question | Réponse | Action |
+|---|---|---|
+| Tes données sont-elles en clusters discrets ? | Oui (emails) | Sélection actuelle suffisante. |
+| As-tu un continuum / des trajectoires ? | Non | PHATE non nécessaire. |
+| Projettes-tu un flux de nouveaux points ? | Non | Parametric UMAP non nécessaire. |
+| La densité de sous-population t'importe-t-elle ? | Peut-être | densMAP déjà inclus pour ça. |
+| La latence sur gros volume devient-elle bloquante ? | Pas encore | h-NNE / FIt-SNE à garder en réserve. |
+
+Sélection finale : **PCA, Isomap, t-SNE, UMAP, TriMap, PaCMAP, densMAP** —
+couverture complète de l'axe local↔global plus la densité, sans redondance
+inutile, avec deux angles morts (trajectoires, inductif) assumés et documentés.
