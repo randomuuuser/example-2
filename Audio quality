@@ -323,3 +323,23 @@ def is_usable(
     if return_details:
         return usable, reasons, scores
     return usable
+
+
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python3 audio_quality.py <path_to_audio.wav_or_mp3>")
+        sys.exit(1)
+
+    audio_path = sys.argv[1]
+    usable, reasons, scores = is_usable(audio_path, return_details=True)
+
+    print(f"file      : {audio_path}")
+    print(f"usable    : {usable}")
+    print(f"reasons   : {reasons if reasons else '-'}")
+    print("scores    :")
+    for k, v in scores.items():
+        print(f"  {k:<20}{v}")
