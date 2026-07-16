@@ -1,84 +1,42 @@
-"""
-Compare method runtimes as a function of the number of samples,
-with a Plotly stacked bar chart.
-
-  x     : number of samples
-  y     : runtime (s)
-  color : method (stacked)
-
-Runtimes are measured sequentially (one method at a time), so they are not
-biased by CPU concurrency. Reuses the reduce_* functions from dr_benchmark.py.
-"""
-
-import time
-
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-from sklearn.preprocessing import normalize
 
-from dr_benchmark import METHODS
+df = pd.read_csv("benchmark_results.csv").set_index("case")
+snr_cases = ["clean", "snr_20dB", "snr_10dB", "snr_5dB", "snr_0dB", "snr_-5dB", "pure_noise"]
+xlabels = ["clean", "20dB", "10dB", "5dB", "0dB", "-5dB", "noise"]
 
+# BNP-ish palette
+C = {"harm": "#00915A", "flat": "#C4262E", "snrw": "#1B3A6B", "snrp": "#E8A33D"}
 
-def measure_runtimes(X, sample_sizes, random_state=0):
-    """
-    Time each method for each sample size.
+def norm(s):
+    s = s.astype(float); return (s - s.min()) / (s.max() - s.min() + 1e-9)
 
-    Args:
-        X            : your embeddings, array (n_samples, n_features).
-        sample_sizes : sizes to test; each one is a random subsample of X.
+fig, ax = plt.subplots(1, 2, figsize=(12, 4.6))
 
-    Returns:
-        DataFrame indexed by n_samples, columns = methods, values = seconds.
-    """
-    X = np.asarray(X, dtype=np.float64)
-    rng = np.random.default_rng(random_state)
-    sizes = [n for n in sample_sizes if n <= len(X)] or [len(X)]
+sub = df.loc[snr_cases]
+ax[0].plot(xlabels, norm(sub["harmonicity"]), "-o", color=C["harm"], lw=2, label="harmonicity (↑cleaner)")
+ax[0].plot(xlabels, 1-norm(sub["spectral_flatness"]), "-s", color=C["flat"], lw=2, label="1 - spectral_flatness")
+ax[0].plot(xlabels, norm(sub["snr_percentile"]), "-^", color=C["snrp"], lw=2, label="snr_percentile")
+ax[0].plot(xlabels, norm(sub["snr_wada"].clip(lower=-20)), "-d", color=C["snrw"], lw=2, label="snr_wada")
+ax[0].set_title("Monotonic response to added noise", fontsize=12, fontweight="bold")
+ax[0].set_ylabel("normalized score (1 = cleanest)")
+ax[0].set_xlabel("degradation level")
+ax[0].legend(fontsize=8, frameon=False); ax[0].grid(alpha=.25)
 
-    rows = {}
-    for n in sizes:
-        print(f"n_samples = {n}")
-        idx = rng.choice(len(X), n, replace=False)
-        Xn = X[idx]
-        row = {}
-        for name, fn in METHODS.items():
-            t0 = time.perf_counter()
-            fn(Xn)
-            row[name] = time.perf_counter() - t0
-        rows[n] = row
-    df = pd.DataFrame(rows).T
-    df.index.name = "n_samples"
-    return df.round(4)
+# special cases: which metric flags what
+special = ["clean", "clipped", "near_silence", "pure_noise"]
+metrics = ["harmonicity", "spectral_flatness", "clipping_ratio", "vad_speech_ratio"]
+vals = df.loc[special, metrics].astype(float).T.values
+im = ax[1].imshow(vals, cmap="RdYlGn_r", aspect="auto", vmin=0, vmax=1)
+ax[1].set_xticks(range(len(special))); ax[1].set_xticklabels(special, rotation=20, fontsize=9)
+ax[1].set_yticks(range(len(metrics))); ax[1].set_yticklabels(metrics, fontsize=9)
+for i in range(len(metrics)):
+    for j in range(len(special)):
+        ax[1].text(j, i, f"{vals[i,j]:.2f}", ha="center", va="center", fontsize=9)
+ax[1].set_title("Who catches what (edge cases)", fontsize=12, fontweight="bold")
 
-
-def plot_stacked_runtimes(df, title="Runtime per method by number of samples"):
-    """Stacked bar: one bar per sample size, one layer per method."""
-    x = [str(n) for n in df.index]  # categorical x -> evenly spaced bars
-    fig = go.Figure()
-    for method in df.columns:
-        fig.add_bar(x=x, y=df[method].values, name=method)
-    fig.update_layout(
-        barmode="stack",
-        title=title,
-        xaxis_title="Number of samples",
-        yaxis_title="Runtime (s)",
-        legend_title="Method",
-        template="plotly_white",
-    )
-    return fig
-
-
-if __name__ == "__main__":
-    from sklearn.datasets import make_blobs
-
-    # Replace with your own embeddings:  X = np.load("my_embeddings.npy")
-    X, _ = make_blobs(n_samples=5000, n_features=128, centers=8, random_state=0)
-    X = normalize(np.asarray(X, dtype=np.float64), norm="l2")
-
-    df = measure_runtimes(X, sample_sizes=[500, 1000, 2000, 4000])
-    print("\n=== Runtime (s): n_samples x methods ===")
-    print(df.to_string())
-
-    fig = plot_stacked_runtimes(df)
-    fig.write_html("dr_runtime_stacked.html")
-    print("\nChart -> dr_runtime_stacked.html")
+plt.tight_layout(); plt.savefig("metric_comparison.png", dpi=130, bbox_inches="tight")
+print("saved")
