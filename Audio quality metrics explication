@@ -161,3 +161,26 @@ Le tableau récapitulatif montre qu'aucune métrique seule ne couvre les trois m
 
 Une seule métrique combinée par une moyenne pondérée masquerait ces trous : un audio saturé pourrait compenser un mauvais score de clipping par un bon score d'harmonicité, et passer le filtre alors qu'il devrait être rejeté. La cascade — trois portes indépendantes, chacune avec son critère spécialisé — garantit qu'aucun mode de corruption n'est "dilué" par les autres.
 
+def harmonicity(wav, sr, min_pitch=75, time_step=0.01):
+    """
+    Harmonics-to-Noise Ratio (HNR) in dB, via Praat's autocorrelation method
+    (Boersma 1993) through parselmouth. Higher = cleaner: a strong periodic
+    voice sits well above the noise floor; broadband noise pushes HNR toward
+    0 and below.
+
+    NOTE: returns dB (roughly -6 .. +30), NOT the old [0,1] autocorrelation
+    peak. Recalibrate is_usable(min_harmonicity=...) accordingly.
+
+    Requires: pip install praat-parselmouth
+    """
+    import parselmouth
+    wav = np.asarray(wav, dtype=np.float64)
+    if wav.size < int(sr * 0.1):                 # too short to analyze
+        return 0.0
+    snd = parselmouth.Sound(wav, sampling_frequency=sr)
+    try:
+        h = snd.to_harmonicity_cc(time_step=time_step, minimum_pitch=min_pitch)
+    except Exception:
+        return 0.0
+    vals = h.values[h.values != -200.0]          # -200 dB = unvoiced/silent frames
+    return float(vals.mean()) if vals.size else 0.0
