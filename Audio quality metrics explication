@@ -1,0 +1,163 @@
+
+## Le problème de fond : qu'est-ce qui différencie la voix du bruit ?
+
+Avant les métriques, il faut un fil conducteur. Une voix humaine, ce n'est physiquement pas n'importe quel son : les cordes vocales vibrent à une fréquence de base (le "pitch", disons 100-300 Hz), et cette vibration crée un signal **quasi-périodique** — un motif qui se répète presque à l'identique toutes les X millisecondes. Le bruit (blanc, bruit de fond, friture), lui, est **aléatoire** : aucune répétition, énergie éparpillée n'importe comment dans le temps et en fréquence.
+
+Toutes les métriques que j'ai testées essaient, chacune à sa manière, de mesurer "est-ce que ce signal ressemble à quelque chose de périodique/structuré, ou à quelque chose de chaotique".
+
+---
+
+## 1. `snr_wada` — estimer le rapport signal/bruit sans connaître le signal propre
+
+**Intuition.** Le SNR classique (Signal-to-Noise Ratio) compare l'énergie de la voix à l'énergie du bruit : `SNR = 10 * log10(énergie_signal / énergie_bruit)`. Le problème : pour calculer ça normalement, il faut connaître séparément la voix propre ET le bruit — ce qu'on n'a jamais en pratique (on ne reçoit que le mélange des deux). WADA (Waveform Amplitude Distribution Analysis) contourne ça par une observation empirique astucieuse.
+
+**L'observation clé.** Si tu prends l'histogramme des amplitudes d'une parole propre (à quelle fréquence chaque niveau d'amplitude apparaît), sa forme suit approximativement une **loi Gamma** avec un paramètre de forme autour de 0,4-0,5. Le bruit blanc gaussien, lui, suit une distribution différente (plus proche d'une gaussienne classique, paramètre de forme = 1). Quand tu mélanges voix + bruit, la forme de la distribution résultante se déplace entre ces deux régimes, et **la quantité de déplacement dépend du SNR**.
+
+**Les maths.** On calcule deux statistiques sur le signal normalisé `|wav|` :
+- `v1 = E[|z|]` — la moyenne des valeurs absolues
+- `v2 = E[log|z|]` — la moyenne des logarithmes des valeurs absolues
+
+Puis `v3 = log(v1) - v2 = log(E[|z|]) - E[log|z|]`. Cette quantité `v3` est justement liée au paramètre de forme de la distribution Gamma sous-jacente (c'est une propriété mathématique de cette famille de distributions — plus un signal est "concentré" autour de zéro avec de rares gros pics, plus cet écart est grand ; plus il est diffus comme du bruit gaussien, plus il est petit).
+
+Le papier original (Kim & Stern) a précalculé, pour chaque valeur de SNR de -20 dB à +100 dB, la valeur théorique de `v3` attendue — c'est la table `_WADA_G` dans le code. On fait alors l'inverse : on calcule `v3` sur ton audio, on cherche où cette valeur tombe dans la table, et on lit le SNR correspondant. C'est une interpolation sur courbe précalculée, pas une formule fermée.
+
+**Pourquoi ça a des ratés dans le test.** Regarde les résultats : `clipped` donne -20 dB (le pire score possible), alors que le signal clippé contient toujours de la voix reconnaissable ! Le clipping déforme tellement la distribution d'amplitude (tout s'écrase contre ±1) que la statistique `v3` sort de la plage couverte par la table, et l'algorithme retombe sur la valeur extrême par défaut. C'est un **artefact de méthode**, documenté par plusieurs utilisateurs sur le gist que j'ai consulté — pas un vrai signe de SNR très bas. Ça illustre bien pourquoi je ne voulais pas m'appuyer sur WADA seul.
+
+---
+
+## 2. `snr_percentile` — la même idée, en plus robuste et plus lisible
+
+**Intuition.** Plutôt que de passer par une distribution théorique compliquée, on fait quelque chose de plus direct : on découpe l'audio en petites tranches temporelles (frames) de 25 ms, on mesure l'énergie de chaque tranche, puis on regarde **la distribution de ces énergies dans le temps**.
+
+L'idée physique : dans un audio avec de la voix + du bruit de fond, il y a des moments où quelqu'un parle fort (voyelles) et des moments plus calmes ou des silences entre les mots. Les tranches "fortes" contiennent signal + bruit, les tranches "faibles" contiennent surtout du bruit résiduel (le plancher de bruit).
+
+**Les maths.** Pour chaque frame, on calcule le RMS (Root Mean Square — la racine carrée de la moyenne des carrés des échantillons, c'est la mesure standard d'énergie/amplitude d'un signal) puis on l'élève au carré pour avoir l'énergie. On prend :
+- le 95ᵉ percentile de ces énergies → approxime "l'énergie dans les moments forts" (signal + bruit)
+- le 10ᵉ percentile → approxime "l'énergie dans les moments faibles" (juste le bruit de fond)
+
+```
+ratio = (énergie_forte - énergie_faible) / énergie_faible
+SNR ≈ 10 * log10(ratio)
+```
+
+C'est littéralement un SNR au sens classique, mais estimé en supposant que les percentiles extrêmes de l'énergie approximent "avec/sans signal utile" — sans avoir besoin de savoir exactement où sont les silences (contrairement à une VAD qui doit détecter précisément les frontières parole/silence).
+
+**Pourquoi c'est plus robuste que WADA dans le test.** Sur le clipping, le résultat est 14,66 dB — un score de qualité correcte, cohérent avec le fait que l'audio contient toujours de la voix audible malgré la distorsion. Contrairement à WADA, cette méthode ne dépend pas d'une hypothèse fine sur la *forme* de la distribution (Gamma), juste sur l'écart d'énergie entre moments forts et faibles — une hypothèse beaucoup plus généraliste, donc moins fragile aux distorsions non-standard comme le clipping.
+
+---
+
+## 3. `harmonicity` — la meilleure métrique du lot, et la plus intuitive
+
+**Intuition physique.** C'est ici qu'on revient directement à l'idée de "périodicité = voix". Quand tu prononces une voyelle, tes cordes vocales vibrent à une fréquence stable pendant quelques dizaines de millisecondes — le signal se répète presque identique à intervalles réguliers. Si tu prends un petit bout de signal et que tu le compares à lui-même décalé dans le temps, à un décalage correspondant exactement à une période de vibration, les deux copies devraient bien se superposer.
+
+Le bruit, lui, n'a pas cette propriété : un bruit blanc décalé de n'importe quelle durée ne ressemble jamais à lui-même.
+
+**L'outil : l'autocorrélation.** L'autocorrélation d'un signal `x` à un décalage (lag) `τ` mesure à quel point `x(t)` ressemble à `x(t+τ)`, en moyenne sur toute la durée du signal :
+
+```
+AC(τ) = Σ x(t) · x(t+τ)
+```
+
+Si `τ = 0`, tu compares le signal à lui-même sans décalage : la ressemblance est maximale par construction (`AC(0)` = l'énergie totale du signal). On normalise donc tout par `AC(0)` pour ramener l'échelle entre 0 et 1 : `AC_normalisée(τ) = AC(τ) / AC(0)`.
+
+**Pourquoi ça détecte le pitch.** Si le signal est périodique de période `T` (donc de fréquence fondamentale `f0 = 1/T`), alors décaler le signal de `τ = T` (une période complète) le fait retomber quasiment sur lui-même : `AC_normalisée(T) ≈ 1`. C'est un pic net dans la courbe d'autocorrélation. Pour du bruit, aucun décalage ne produit un tel pic — la courbe reste plate et proche de zéro partout.
+
+**Le code, étape par étape :**
+1. On découpe en frames de 40 ms (assez long pour contenir plusieurs cycles de vibration même à une fréquence de pitch basse).
+2. On ignore les frames quasi-silencieuses (sinon on mesurerait de l'autocorrélation sur du bruit de fond pur, ce qui n'a pas de sens).
+3. On calcule l'autocorrélation complète de la frame.
+4. On restreint la recherche du pic à une plage de décalages plausible pour une voix humaine : `lag_min = sr/f_max` à `lag_max = sr/f_min`, avec `f_min=60 Hz` et `f_max=400 Hz` (couvre grosso modo les voix graves aux voix aiguës). Ça évite de confondre un pic de haute fréquence avec un vrai pitch.
+5. On prend le maximum de l'autocorrélation normalisée dans cette plage — c'est le score de périodicité de la frame.
+6. On moyenne sur toutes les frames actives de l'audio.
+
+**Pourquoi c'est la métrique qui a le mieux marché.** Regarde la courbe : elle descend de façon parfaitement monotone avec le bruit ajouté (0,73 → 0,66 → 0,53 → 0,44 → 0,33 → 0,21 → 0,10 pour bruit pur), *et* elle reste haute sur le clipping (0,75). C'est cohérent avec l'intuition physique : le clipping déforme l'*amplitude* du signal (il écrase les pics) mais préserve globalement sa *périodicité temporelle* — le rythme de répétition du signal clippé reste proche de celui du signal propre. Le bruit ajouté, lui, détruit directement la périodicité en noyant le motif répétitif sous des fluctuations aléatoires. L'autocorrélation est donc sensible à exactement le bon type de dégradation pour ton cas d'usage (intelligibilité pour l'ASR), et insensible à un type de dégradation qui ne devrait pas forcément faire rejeter un audio.
+
+---
+
+## 4. `spectral_flatness` — la même idée que l'harmonicité, mais vue depuis le domaine fréquentiel
+
+**Intuition.** Au lieu de regarder la répétition dans le temps, on regarde comment l'énergie est répartie entre les fréquences. Un son voisé (voyelle) concentre son énergie sur quelques fréquences précises : le fondamental et ses harmoniques (multiples entiers du fondamental — c'est la même physique que pourquoi une corde de guitare pincée sonne "musicale": elle vibre à f0, 2f0, 3f0... simultanément). Le spectre ressemble à une série de pics fins.
+
+Le bruit blanc, à l'inverse, a une énergie étalée uniformément sur toutes les fréquences — un spectre "plat", sans structure.
+
+**Les maths.** La spectral flatness (aussi appelée "entropie de Wiener") compare deux façons de résumer un ensemble de valeurs positives (ici, l'énergie à chaque fréquence du spectre) :
+
+```
+flatness = moyenne_géométrique(énergie_par_fréquence) / moyenne_arithmétique(énergie_par_fréquence)
+```
+
+- **Moyenne géométrique** : `(x1 · x2 · ... · xn)^(1/n)` — très sensible à la présence de petites valeurs (si une seule valeur est proche de zéro, elle tire fortement la moyenne géométrique vers le bas).
+- **Moyenne arithmétique** : `(x1 + x2 + ... + xn)/n` — la moyenne classique, insensible à la distribution, juste à la somme totale.
+
+**Pourquoi ce ratio capte la "forme" du spectre.** Si l'énergie est concentrée sur quelques fréquences (pics nets, beaucoup de fréquences à énergie quasi nulle entre les pics) : la moyenne géométrique s'effondre à cause des nombreuses valeurs proches de zéro, alors que la moyenne arithmétique reste dominée par les pics. Le ratio devient donc **petit** (proche de 0) — c'est le cas d'un signal voisé/harmonique. Si l'énergie est uniformément répartie (bruit blanc), les deux moyennes sont proches l'une de l'autre, et le ratio tend vers **1**.
+
+C'est en fait mathématiquement lié à l'entropie du spectre : un spectre "plat" a une entropie maximale (aucune fréquence n'est privilégiée, donc "surprise maximale" au sens de la théorie de l'information), un spectre à pics nets a une entropie faible (on peut prédire où sera l'énergie).
+
+**Pourquoi elle marche bien dans le test.** Monte proprement avec le bruit ajouté (0,0 → 0,088 → 0,20 → 0,29 → 0,38 → 0,48 → 0,56 pour bruit pur) et reste quasi nulle sur le clipping (0,0012) — le clipping écrête l'amplitude mais ne rend pas le spectre uniforme, contrairement au bruit additif qui, lui, ajoute justement de l'énergie partout dans le spectre. C'est le complément naturel de l'harmonicité : deux angles de vue différents (temporel vs fréquentiel) sur le même phénomène physique.
+
+---
+
+## 5. `clipping_ratio` — détecter la saturation, un problème différent du bruit
+
+**Intuition.** Le clipping se produit quand le niveau d'enregistrement est trop fort pour le convertisseur (micro, carte son) : au lieu de laisser l'onde monter/descendre librement, l'électronique "coupe" le signal dès qu'il atteint la limite du système (par exemple ±1 en échelle normalisée). Visuellement, les sommets des ondes qui devraient être arrondis deviennent plats. C'est un problème complètement différent du bruit : ce n'est pas de l'énergie parasite ajoutée, c'est une **déformation non-linéaire** du signal existant.
+
+**Les maths.** On calcule la fraction des échantillons dont la valeur absolue dépasse un seuil proche du maximum théorique (99% du pic normalisé) :
+
+```
+clipping_ratio = (nombre d'échantillons avec |x| ≥ 0.99) / (nombre total d'échantillons)
+```
+
+C'est volontairement une mesure très simple et directe — pas besoin de sophistication ici, la saturation se voit littéralement dans les valeurs brutes.
+
+**Pourquoi c'est indispensable en complément.** Regarde le tableau : c'est la SEULE métrique qui distingue vraiment le cas `clipped` (0,42) de tous les autres (~0). Ni l'harmonicité ni la flatness ne réagissent fortement au clipping (c'est justement leur qualité pour ne pas confondre saturation et bruit — mais ça veut dire qu'aucune des deux ne peut *détecter* la saturation). D'où la nécessité d'une porte dédiée.
+
+---
+
+## 6. `rms_dbfs` — la loudness absolue, pour détecter le silence/audio mort
+
+**Intuition.** C'est la mesure la plus simple de toutes : "à quel point ce signal est-il fort dans l'absolu ?" indépendamment de sa forme ou de sa structure. Un fichier corrompu au point d'être vide, ou un enregistrement où le micro n'a rien capté, aura une énergie proche de zéro tout le temps — aucune des métriques précédentes (qui cherchent une *structure* dans le signal) ne peut détecter ça, puisqu'un silence n'a ni structure ni absence de structure : il n'y a juste rien à mesurer.
+
+**Les maths.** Le RMS (Root Mean Square) est la racine carrée de la moyenne des carrés des échantillons — la façon standard de résumer "l'amplitude typique" d'un signal qui oscille autour de zéro (une simple moyenne donnerait ~0 à cause des valeurs positives et négatives qui s'annulent) :
+
+```
+RMS = √(moyenne(x²))
+```
+
+On convertit ensuite en décibels relatifs au plein niveau (dBFS = decibels relative to Full Scale), l'unité standard en audio numérique :
+
+```
+dBFS = 20 · log10(RMS)
+```
+
+Le facteur 20 (plutôt que 10 comme pour une énergie) vient du fait qu'on travaille ici en amplitude et non en puissance — la puissance est proportionnelle au carré de l'amplitude, donc passer de l'amplitude en dB nécessite ce facteur 2 supplémentaire (`10·log10(x²) = 20·log10(x)`). Un signal à pleine échelle (RMS=1) donne 0 dBFS ; un signal deux fois plus faible en amplitude donne environ -6 dBFS ; un vrai silence numérique tend vers -∞ dBFS (d'où le `+ EPS` dans le code pour éviter `log10(0)`).
+
+**Le piège corrigé la dernière fois.** Cette formule suppose que `x` est déjà en flottant dans [-1, 1]. Si tu lui donnes un array int16 brut (valeurs jusqu'à ±32767), le RMS calculé est ~32768 fois trop grand, et le dBFS explose à des valeurs absurdes (+80 dB au lieu de valeurs négatives normales) — d'où la nécessité de la normalisation `_to_float` qu'on a ajoutée en amont, avant même que cette métrique ne voie le signal.
+
+---
+
+## 7. `vad_speech_ratio` (WebRTC VAD) — un détecteur binaire, pas un score continu
+
+**Intuition.** Contrairement à toutes les métriques précédentes qui donnent un score continu, une VAD (Voice Activity Detection) prend une décision binaire par petite tranche de temps : "y a-t-il de la voix dans ces 30 ms, oui ou non ?". WebRTC VAD (développé par Google pour les appels vidéo) utilise un modèle statistique simple — un mélange de gaussiennes (GMM) entraîné sur des features spectrales — pour faire cette classification frame par frame, sans réseau de neurones ni poids à télécharger (ce qui correspond à ta contrainte).
+
+**Ce qu'on en tire.** On fait tourner la VAD sur tout l'audio, et on calcule la fraction de frames classées "voix" :
+
+```
+vad_speech_ratio = (nombre de frames voix) / (nombre total de frames)
+```
+
+**Pourquoi c'est utile seulement pour le silence, pas pour le bruit.** Regarde le tableau : sur `pure_noise`, WebRTC VAD renvoie 1.0 — il classe le bruit comme "voix" ! Ce n'est pas un bug : les VAD légères comme celle-ci se basent souvent sur des critères d'énergie/spectre assez frustres, et un bruit large-bande peut ressembler suffisamment à de la parole en termes d'énergie pour tromper le détecteur. En revanche, sur `near_silence`, elle renvoie 0.0 — parfait, car là il n'y a tout simplement pas assez d'énergie pour déclencher quoi que ce soit. C'est pour ça que je l'utilise uniquement comme une **porte anti-silence** (en complément du RMS absolu), jamais comme juge de la qualité/propreté du signal.
+
+---
+
+## Pourquoi la cascade à trois portes, et pas une métrique unique pondérée
+
+Le tableau récapitulatif montre qu'aucune métrique seule ne couvre les trois modes de corruption qu'on veut attraper :
+
+| Mode de corruption | Détecté par | Raté par |
+|---|---|---|
+| Silence / audio mort | `rms_dbfs`, `vad_speech_ratio` | harmonicity, flatness (rien à mesurer) |
+| Saturation / clipping | `clipping_ratio` | harmonicity, flatness (insensibles, à raison) |
+| Bruit / signal noyé | `harmonicity`, `spectral_flatness`, SNR | clipping_ratio (pas de saturation), VAD (trompée) |
+
+Une seule métrique combinée par une moyenne pondérée masquerait ces trous : un audio saturé pourrait compenser un mauvais score de clipping par un bon score d'harmonicité, et passer le filtre alors qu'il devrait être rejeté. La cascade — trois portes indépendantes, chacune avec son critère spécialisé — garantit qu'aucun mode de corruption n'est "dilué" par les autres.
+
