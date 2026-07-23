@@ -106,3 +106,11 @@ total = df_seg[["sub", "del", "ins"]].sum()
 print((100 * total / total.sum()).round(1).to_string())
 
     return results
+
+
+
+
+by_call = df_seg.groupby("sample_id").apply(
+    lambda g: (g["sub"] + g["del"] + g["ins"]).sum() / g["n_ref"].sum()
+)
+print(by_call.round(3))
