@@ -1,0 +1,54 @@
+import numpy as np
+import soundfile as sf
+from scipy import signal
+from scipy.stats import spearmanr
+
+
+def load_audio(path, target_sr=16000):
+    """Load audio, return list of channels (mono -> 1, stereo -> 2) and sample rate."""
+    data, sr = sf.read(path, always_2d=True, dtype="float64")
+    if sr != target_sr:
+        data = signal.resample(data, int(round(data.shape[0] * target_sr / sr)), axis=0)
+        sr = target_sr
+    return [data[:, i] for i in range(data.shape[1])], sr
+
+
+def segment_energy_features(x, sr, start_time, end_time):
+    """Basic level features on one segment."""
+    seg = x[int(start_time * sr):int(end_time * sr)]
+    if len(seg) < sr * 0.1:
+        return None
+    rms = np.sqrt(np.mean(seg ** 2))
+    return {
+        "rms_db": 20 * np.log10(rms + 1e-10),
+        "peak_db": 20 * np.log10(np.abs(seg).max() + 1e-10),
+        "dynamic_range": 20 * np.log10((np.abs(seg).max() + 1e-10) / (rms + 1e-10)),
+    }
+
+
+MIN_REF_WORDS = 10
+
+rows = []
+for sample_id, sample in samples.items():
+    channels, sr = load_audio(sample["path_audio"])
+    ch_map = {sample["channel_client"]: 0, sample["channel_operator"]: 1}
+
+    for seg in wer_per_segment(sample):
+        if seg["n_ref"] < MIN_REF_WORDS:
+            continue
+        idx = ch_map.get(seg["channel"], 0)
+        if idx >= len(channels):
+            idx = 0
+        feats = segment_energy_features(channels[idx], sr, seg["start_time"], seg["end_time"])
+        if feats is None:
+            continue
+        rows.append({**seg, **feats, "sample_id": sample_id})
+
+df = pd.DataFrame(rows)
+print(f"{len(df)} segments retenus (n_ref >= {MIN_REF_WORDS})")
+print(f"WER median={df['wer'].median():.3f}  IQR=[{df['wer'].quantile(.25):.3f}, {df['wer'].quantile(.75):.3f}]")
+
+for feat in ["rms_db", "peak_db", "dynamic_range", "duration"]:
+    rho, p = spearmanr(df[feat], df["wer"])
+    print(f"  {feat:15s} rho={rho:+.3f}  p={p:.4f}")
+
