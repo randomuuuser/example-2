@@ -1,0 +1,196 @@
+import numpy as np
+
+
+def energy_envelope(x, sr, frame_ms=10):
+    """Short-time energy envelope in dB."""
+    frame = int(sr * frame_ms / 1000)
+    n_frames = len(x) // frame
+    if n_frames < 10:
+        return None
+    frames = x[:n_frames * frame].reshape(n_frames, frame)
+    energy = np.sum(frames ** 2, axis=1)
+    return 10 * np.log10(energy + 1e-12)
+
+
+def estimate_c50(x, sr, frame_ms=10, min_decay_frames=5):
+    """Blind C50 estimate from energy decay slopes.
+
+    Finds monotonically decaying stretches in the energy envelope, fits a slope
+    to each, and converts the median decay rate into a clarity index.
+    Higher C50 = clearer, less reverberant.
+    """
+    env = energy_envelope(x, sr, frame_ms)
+    if env is None:
+        return None
+
+    # only consider decays starting from reasonably loud frames
+    threshold = np.percentile(env, 60)
+
+    slopes = []
+    i = 0
+    while i < len(env) - min_decay_frames:
+        if env[i] < threshold:
+            i += 1
+            continue
+        # extend while energy keeps dropping
+        j = i
+        while j + 1 < len(env) and env[j + 1] < env[j]:
+            j += 1
+        if j - i >= min_decay_frames:
+            y = env[i:j + 1]
+            t = np.arange(len(y)) * frame_ms / 1000.0
+            slope = np.polyfit(t, y, 1)[0]  # dB per second
+            if slope < 0:
+                slopes.append(slope)
+            i = j + 1
+        else:
+            i += 1
+
+    if len(slopes) < 3:
+        return None
+
+    median_slope = np.median(slopes)          # dB/s, negative
+    t60 = -60.0 / median_slope                # seconds to drop 60 dB
+    t60 = np.clip(t60, 0.05, 3.0)
+
+    # Under an exponential decay model, energy ratio before/after 50 ms
+    decay_rate = 6.9078 / t60                 # ln(1000)/T60
+    early = 1.0 - np.exp(-decay_rate * 0.050)
+    late = np.exp(-decay_rate * 0.050)
+    return 10 * np.log10(early / late)
+
+
+
+from scipy.stats import spearmanr
+
+MIN_REF_WORDS = 10
+
+rows = []
+for sample_id, sample in samples.items():
+    channels, sr = load_audio(sample["path_audio"])
+    ch_map = {sample["channel_client"]: 0, sample["channel_operator"]: 1}
+
+    for seg in wer_per_segment(sample):
+        if seg["n_ref"] < MIN_REF_WORDS:
+            continue
+        idx = ch_map.get(seg["channel"], 0)
+        if idx >= len(channels):
+            idx = 0
+        x = channels[idx][int(seg["start_time"] * sr):int(seg["end_time"] * sr)]
+
+        c50 = estimate_c50(x, sr)
+        if c50 is None:
+            continue
+
+        rms = np.sqrt(np.mean(x ** 2))
+        rows.append({
+            **seg,
+            "sample_id": sample_id,
+            "c50": c50,
+            "rms_db": 20 * np.log10(rms + 1e-10),
+        })
+
+df = pd.DataFrame(rows)
+print(f"{len(df)} segments avec C50 estimable\n")
+print(df["c50"].describe().round(2).to_string())
+
+print("\nCorrelation avec le WER :")
+for feat in ["c50", "rms_db", "duration"]:
+    rho, p = spearmanr(df[feat], df["wer"])
+    print(f"  {feat:12s} rho={rho:+.3f}  p={p:.5f}")
+
+print("\nSur les segments longs (>= 3s) :")
+long_seg = df[df["duration"] >= 3.0]
+print(f"  n={len(long_seg)}")
+for feat in ["c50", "rms_db"]:
+    rho, p = spearmanr(long_seg[feat], long_seg["wer"])
+    print(f"  {feat:12s} rho={rho:+.3f}  p={p:.5f}")
+
+
+
+// ------------ SUR AUDIO COMPLETS
+
+def call_level_features(sample, min_speech_ratio=0.01):
+    """Acoustic features over a whole call, computed per channel.
+
+    Speech regions come from the ground-truth segment boundaries, concatenated
+    per channel. Stereo -> features on both channels; the aggregate keeps the
+    worst value, since call WER is driven by the harder channel.
+    """
+    channels, sr = load_audio(sample["path_audio"])
+    ch_map = {sample["channel_client"]: 0, sample["channel_operator"]: 1}
+
+    gt_segs = extract_segments(sample, "label")
+    duration_total = len(channels[0]) / sr
+
+    per_channel = {}
+    for ch_value, ch_idx in ch_map.items():
+        if ch_idx >= len(channels):
+            continue
+        x = channels[ch_idx]
+
+        # concatenate speech regions for this channel
+        parts = [
+            x[int(s["start_time"] * sr):int(s["end_time"] * sr)]
+            for s in gt_segs if s["channel"] == ch_value
+        ]
+        parts = [p for p in parts if len(p) > 0]
+        if not parts:
+            continue
+
+        speech = np.concatenate(parts)
+        speech_duration = len(speech) / sr
+        if speech_duration / duration_total < min_speech_ratio:
+            continue
+
+        rms = np.sqrt(np.mean(speech ** 2))
+        per_channel[ch_idx] = {
+            "c50": estimate_c50(speech, sr),
+            "rms_db": 20 * np.log10(rms + 1e-10),
+            "speech_ratio": speech_duration / duration_total,
+            "n_segments": len(parts),
+        }
+
+    if not per_channel:
+        return None
+
+    # aggregate: worst channel for quality, sum/mean for the rest
+    c50_values = [v["c50"] for v in per_channel.values() if v["c50"] is not None]
+    return {
+        "c50_min": min(c50_values) if c50_values else None,
+        "c50_mean": float(np.mean(c50_values)) if c50_values else None,
+        "rms_db_min": min(v["rms_db"] for v in per_channel.values()),
+        "speech_ratio_total": sum(v["speech_ratio"] for v in per_channel.values()),
+        "duration": duration_total,
+        "n_channels": len(per_channel),
+    }
+
+
+rows = []
+for sample_id, sample in samples.items():
+    feats = call_level_features(sample)
+    if feats is None:
+        print(f"skipped: {sample_id}")
+        continue
+    rows.append({"sample_id": sample_id, **feats})
+
+df_call = pd.DataFrame(rows).set_index("sample_id")
+print(df_call.round(2).to_string())
+
+
+from scipy.stats import spearmanr
+
+# align with your saved per-call WER (adapt the join to your index format)
+df_call["wer_ft"] = [dict(data_wer_1).get(i) for i in df_call.index]
+df_call["wer_zs"] = [dict(data_wer_2).get(i) for i in df_call.index]
+
+print(df_call[["wer_ft", "wer_zs"]].isna().sum())  # check the join worked
+
+for target in ["wer_ft", "wer_zs"]:
+    print(f"\n--- {target} ---")
+    for feat in ["c50_min", "c50_mean", "rms_db_min", "speech_ratio_total", "duration"]:
+        sub = df_call[[feat, target]].dropna()
+        if len(sub) < 5:
+            continue
+        rho, p = spearmanr(sub[feat], sub[target])
+        print(f"  {feat:20s} rho={rho:+.3f}  p={p:.3f}  (n={len(sub)})")
