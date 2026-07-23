@@ -1,67 +1,63 @@
-import json
+import unicodedata
+import jiwer
+
+# --- Normalization -----------------------------------------------------
+
+def strip_accents(text):
+    """Remove diacritics. Set USE_STRIP_ACCENTS to match how your saved WER was computed."""
+    text = unicodedata.normalize("NFD", text)
+    return "".join(c for c in text if unicodedata.category(c) != "Mn")
 
 
-def load_manifest(json_path):
-    """Load the test-set JSON and return the samples dict."""
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data["samples"]
+USE_STRIP_ACCENTS = True  # align with the pipeline that produced your call-level WER
+
+wer_transform = jiwer.Compose([
+    jiwer.ToLowerCase(),
+    jiwer.RemovePunctuation(),
+    jiwer.RemoveMultipleSpaces(),
+    jiwer.Strip(),
+    jiwer.ReduceToListOfListOfWords(),
+])
 
 
-def extract_segments(sample, kind="label"):
-    """Flatten one sample's segments into a list of simple dicts.
-
-    kind: "label" for ground truth, "prediction" for the ASR output.
-    """
-    segments = sample.get(kind, {}).get("segments", [])
-    out = []
-    for seg in segments:
-        out.append({
-            "start_time": seg["start_time"],
-            "end_time": seg["end_time"],
-            "channel": seg["channel"],
-            "text": seg.get("annotation", {}).get("text", ""),
-        })
-    return out
+def prepare(text):
+    return strip_accents(text) if USE_STRIP_ACCENTS else text
 
 
-def describe_sample(sample_id, sample):
-    """Quick sanity check on one sample: durations, channels, segment counts."""
-    gt = extract_segments(sample, "label")
-    pred = extract_segments(sample, "prediction")
-    channels_seen = sorted({s["channel"] for s in gt})
-    total_speech = sum(s["end_time"] - s["start_time"] for s in gt)
-    print(f"{sample_id}")
-    print(f"  path: {sample['path_audio']}")
-    print(f"  operator ch: {sample['channel_operator']} | client ch: {sample['channel_client']}")
-    print(f"  channels in segments: {channels_seen}")
-    print(f"  gt segments: {len(gt)} | pred segments: {len(pred)}")
-    print(f"  total speech: {total_speech:.1f}s")
+# --- WER ---------------------------------------------------------------
 
-samples = load_manifest("chemin/vers/test_set.json")
-print(f"{len(samples)} samples\n")
-for sample_id, sample in samples.items():
-    describe_sample(sample_id, sample)
-    print()
-
-
+def compute_wer_detailed(reference, hypothesis):
+    """WER with S/D/I breakdown. Returns None if the reference is empty."""
+    if not reference.strip():
+        return None
+    out = jiwer.process_words(
+        prepare(reference), prepare(hypothesis),
+        reference_transform=wer_transform,
+        hypothesis_transform=wer_transform,
+    )
+    return {
+        "wer": out.wer,
+        "sub": out.substitutions,
+        "del": out.deletions,
+        "ins": out.insertions,
+        "n_ref": out.substitutions + out.deletions + out.hits,
+    }
 
 
-
-
-import numpy as np
+# --- Per-segment WER ---------------------------------------------------
 
 def wer_per_segment(sample):
-    """Compute WER for each ground-truth segment, matched to prediction by overlap.
+    """WER for each ground-truth segment, matched to predictions by temporal overlap.
 
-    Returns a list of dicts with timing, channel, WER, and reference length.
+    Prediction segmentation does not align with reference segmentation, so all
+    predicted segments overlapping a reference segment on the same channel are
+    concatenated in temporal order.
     """
     gt_segs = extract_segments(sample, "label")
     pred_segs = extract_segments(sample, "prediction")
 
     results = []
     for gt in gt_segs:
-        # collect predicted segments overlapping this reference segment, same channel
         hyp_parts = []
         for pred in pred_segs:
             if pred["channel"] != gt["channel"]:
@@ -73,37 +69,40 @@ def wer_per_segment(sample):
         hyp_parts.sort()
         hyp = " ".join(t for _, t in hyp_parts)
 
-        wer = compute_wer(gt["text"], hyp)
-        if wer is None:
-            continue  # empty reference
+        scores = compute_wer_detailed(gt["text"], hyp)
+        if scores is None:
+            continue
 
         results.append({
             "start_time": gt["start_time"],
             "end_time": gt["end_time"],
             "duration": gt["end_time"] - gt["start_time"],
             "channel": gt["channel"],
-            "n_ref_words": len(normalize_text(gt["text"]).split()),
-            "wer": wer,
+            **scores,
         })
 
-    return results
 
+import numpy as np
+import pandas as pd
 
-all_segments = []
+rows = []
 for sample_id, sample in samples.items():
     for seg in wer_per_segment(sample):
         seg["sample_id"] = sample_id
-        all_segments.append(seg)
+        rows.append(seg)
 
-wers = np.array([s["wer"] for s in all_segments])
-durations = np.array([s["duration"] for s in all_segments])
-n_words = np.array([s["n_ref_words"] for s in all_segments])
+df_seg = pd.DataFrame(rows)
 
-print(f"{len(all_segments)} segments")
-print(f"WER      : min={wers.min():.2f} median={np.median(wers):.2f} max={wers.max():.2f}")
-print(f"duration : median={np.median(durations):.1f}s")
-print(f"ref words: median={np.median(n_words):.0f}")
-print()
+print(f"{len(df_seg)} segments sur {df_seg['sample_id'].nunique()} appels\n")
+print(df_seg[["duration", "n_ref", "wer", "sub", "del", "ins"]].describe().round(2))
+
+print("\nDistribution du WER :")
 for lo, hi in [(0, 0.05), (0.05, 0.2), (0.2, 0.5), (0.5, 1.0), (1.0, 99)]:
-    n = ((wers >= lo) & (wers < hi)).sum()
-    print(f"  WER [{lo:.2f}, {hi:.2f}) : {n:4d} ({100*n/len(wers):.0f}%)")
+    n = ((df_seg["wer"] >= lo) & (df_seg["wer"] < hi)).sum()
+    print(f"  [{lo:.2f}, {hi:.2f}) : {n:4d} ({100*n/len(df_seg):.0f}%)")
+
+print("\nRépartition des erreurs :")
+total = df_seg[["sub", "del", "ins"]].sum()
+print((100 * total / total.sum()).round(1).to_string())
+
+    return results
