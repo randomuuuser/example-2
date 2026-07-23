@@ -1,3 +1,54 @@
+import json
+
+
+def load_manifest(json_path):
+    """Load the test-set JSON and return the samples dict."""
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data["samples"]
+
+
+def extract_segments(sample, kind="label"):
+    """Flatten one sample's segments into a list of simple dicts.
+
+    kind: "label" for ground truth, "prediction" for the ASR output.
+    """
+    segments = sample.get(kind, {}).get("segments", [])
+    out = []
+    for seg in segments:
+        out.append({
+            "start_time": seg["start_time"],
+            "end_time": seg["end_time"],
+            "channel": seg["channel"],
+            "text": seg.get("annotation", {}).get("text", ""),
+        })
+    return out
+
+
+def describe_sample(sample_id, sample):
+    """Quick sanity check on one sample: durations, channels, segment counts."""
+    gt = extract_segments(sample, "label")
+    pred = extract_segments(sample, "prediction")
+    channels_seen = sorted({s["channel"] for s in gt})
+    total_speech = sum(s["end_time"] - s["start_time"] for s in gt)
+    print(f"{sample_id}")
+    print(f"  path: {sample['path_audio']}")
+    print(f"  operator ch: {sample['channel_operator']} | client ch: {sample['channel_client']}")
+    print(f"  channels in segments: {channels_seen}")
+    print(f"  gt segments: {len(gt)} | pred segments: {len(pred)}")
+    print(f"  total speech: {total_speech:.1f}s")
+
+samples = load_manifest("chemin/vers/test_set.json")
+print(f"{len(samples)} samples\n")
+for sample_id, sample in samples.items():
+    describe_sample(sample_id, sample)
+    print()
+
+
+
+
+
+
 import numpy as np
 
 def wer_per_segment(sample):
