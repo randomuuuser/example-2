@@ -1,0 +1,58 @@
+import numpy as np
+
+def wer_per_segment(sample):
+    """Compute WER for each ground-truth segment, matched to prediction by overlap.
+
+    Returns a list of dicts with timing, channel, WER, and reference length.
+    """
+    gt_segs = extract_segments(sample, "label")
+    pred_segs = extract_segments(sample, "prediction")
+
+    results = []
+    for gt in gt_segs:
+        # collect predicted segments overlapping this reference segment, same channel
+        hyp_parts = []
+        for pred in pred_segs:
+            if pred["channel"] != gt["channel"]:
+                continue
+            overlap = min(gt["end_time"], pred["end_time"]) - max(gt["start_time"], pred["start_time"])
+            if overlap > 0:
+                hyp_parts.append((pred["start_time"], pred["text"]))
+
+        hyp_parts.sort()
+        hyp = " ".join(t for _, t in hyp_parts)
+
+        wer = compute_wer(gt["text"], hyp)
+        if wer is None:
+            continue  # empty reference
+
+        results.append({
+            "start_time": gt["start_time"],
+            "end_time": gt["end_time"],
+            "duration": gt["end_time"] - gt["start_time"],
+            "channel": gt["channel"],
+            "n_ref_words": len(normalize_text(gt["text"]).split()),
+            "wer": wer,
+        })
+
+    return results
+
+
+all_segments = []
+for sample_id, sample in samples.items():
+    for seg in wer_per_segment(sample):
+        seg["sample_id"] = sample_id
+        all_segments.append(seg)
+
+wers = np.array([s["wer"] for s in all_segments])
+durations = np.array([s["duration"] for s in all_segments])
+n_words = np.array([s["n_ref_words"] for s in all_segments])
+
+print(f"{len(all_segments)} segments")
+print(f"WER      : min={wers.min():.2f} median={np.median(wers):.2f} max={wers.max():.2f}")
+print(f"duration : median={np.median(durations):.1f}s")
+print(f"ref words: median={np.median(n_words):.0f}")
+print()
+for lo, hi in [(0, 0.05), (0.05, 0.2), (0.2, 0.5), (0.5, 1.0), (1.0, 99)]:
+    n = ((wers >= lo) & (wers < hi)).sum()
+    print(f"  WER [{lo:.2f}, {hi:.2f}) : {n:4d} ({100*n/len(wers):.0f}%)")
