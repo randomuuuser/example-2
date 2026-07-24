@@ -1,45 +1,47 @@
+import numpy as np
+import pandas as pd
 from scipy.stats import spearmanr
 from sklearn.metrics import roc_auc_score
 
-def evaluate_extremes(df, score_col, target_col, exclude_middle=0.4):
-    """Correlation restricted to the clear-cut cases (Angle A).
 
-    Removes the middle band of the TARGET (not the score) where ranking is
-    noise, then measures correlation on the extremes.
+def aggregate_to_call(df_seg, score_col="score_full", weight_col="n_ref"):
+    """Aggregate segment-level scores to a call-level difficulty score.
+
+    A call is hard if it CONTAINS hard segments, so high percentiles and the
+    reference-word-weighted mean matter more than a plain mean.
     """
-    lo = df[target_col].quantile(exclude_middle / 2)
-    hi = df[target_col].quantile(1 - exclude_middle / 2)
-    tails = df[(df[target_col] <= lo) | (df[target_col] >= hi)]
-    rho, p = spearmanr(tails[score_col], tails[target_col])
-    return rho, p, len(tails)
-
-
-def evaluate_flagging(df, score_col, target_col, hard_quantile=0.75, flag_rate=0.25):
-    """Detection metrics for the real use case (Angle B).
-
-    'Hard' = worst hard_quantile of true WER. 'Flagged' = worst flag_rate of score.
-    Reports how well the score catches the truly hard segments.
-    """
-    hard = df[target_col] >= df[target_col].quantile(hard_quantile)
-    flagged = df[score_col] >= df[score_col].quantile(1 - flag_rate)
-
-    tp = (hard & flagged).sum()
-    precision = tp / flagged.sum() if flagged.sum() else 0
-    recall = tp / hard.sum() if hard.sum() else 0
-    auc = roc_auc_score(hard, df[score_col])
-    return {"precision": precision, "recall": recall, "auc": auc,
-            "n_hard": int(hard.sum()), "n_flagged": int(flagged.sum())}
+    rows = []
+    for sid, g in df_seg.groupby("sample_id"):
+        s = g[score_col].dropna()
+        if len(s) == 0:
+            continue
+        w = g.loc[s.index, weight_col]
+        rows.append({
+            "sample_id": sid,
+            "score_mean": s.mean(),
+            "score_wmean": np.average(s, weights=w) if w.sum() > 0 else s.mean(),
+            "score_p75": s.quantile(0.75),
+            "score_p90": s.quantile(0.90),
+            "score_max": s.max(),
+            "n_segments": len(s),
+        })
+    return pd.DataFrame(rows).set_index("sample_id")
 
 
 
+call_scores = aggregate_to_call(df_pe, score_col="score_full")
 
-print("=== Angle A: correlation on clear-cut cases ===")
-for excl in [0.0, 0.3, 0.5, 0.7]:
-    rho, p, n = evaluate_extremes(df_pe, "score_full", "wer_zs", exclude_middle=excl)
-    print(f"  exclude middle {excl:.0%}  ->  rho={rho:+.3f}  (n={n})")
+# attach the saved per-call WER — adapt keys to your index
+call_scores["wer_zs"] = [dict(data_wer_2).get(i) for i in call_scores.index]
+call_scores["wer_ft"] = [dict(data_wer_1).get(i) for i in call_scores.index]
 
-print("\n=== Angle B: flagging the hardest ===")
-m = evaluate_flagging(df_pe, "score_full", "wer_zs")
-print(f"  AUC={m['auc']:.3f}")
-print(f"  flagging worst 25%: precision={m['precision']:.2f}  recall={m['recall']:.2f}")
-print(f"  (chance precision would be {m['n_hard']/len(df_pe):.2f})")
+print(call_scores.round(3).to_string())
+print(f"\nNaN check:\n{call_scores[['wer_zs','wer_ft']].isna().sum()}")
+
+AGG = ["score_mean", "score_wmean", "score_p75", "score_p90", "score_max"]
+print(f"\n{'aggregation':14s} {'rho_wer_zs':>12s} {'rho_wer_ft':>12s}")
+for agg in AGG:
+    sub = call_scores[[agg, "wer_zs", "wer_ft"]].dropna()
+    rho_zs = spearmanr(sub[agg], sub["wer_zs"])[0]
+    rho_ft = spearmanr(sub[agg], sub["wer_ft"])[0]
+    print(f"{agg:14s} {rho_zs:+12.3f} {rho_ft:+12.3f}")
