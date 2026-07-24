@@ -1,0 +1,38 @@
+
+## Feature par feature, ce qui transfère et ce qui casse
+
+**`oov_rate` — dépendant, réplicable avec effort.** L'OOV se mesure contre un lexique. Aujourd'hui ce lexique vient de ta ground truth. Sur un nouveau dataset sans annotation, tu n'as pas de lexique de référence. Il faut donc soit un lexique de la langue construit à l'avance, soit le dériver des transcriptions 0-shot elles-mêmes (moins propre, mais sans annotation). À prévoir : une source de vocabulaire par langue.
+
+**`perplexity` — le plus fragile.** Le modèle n-gram est entraîné sur tes transcriptions ground truth. Nouveau dataset, nouvelle langue = nouveau modèle à réentraîner, et sur un corpus sans annotation tu n'as pas de texte propre pour l'entraîner. C'est la feature la moins réplicable telle quelle. Tu peux l'entraîner sur les transcriptions 0-shot, mais alors la perplexité est faible partout par construction (le LM a vu le texte qu'il évalue), et le signal s'affaiblit.
+
+**`compression` — entièrement agnostique.** `len(gzip(texte))/len(texte)`. Aucune dépendance à la langue, au lexique, à un modèle. Elle marche identiquement partout. C'est ta feature la plus robuste, et ce n'est pas un hasard si elle tient sur les deux corpus.
+
+**`hyp_words` — agnostique mais traître.** Le nombre de mots ne dépend d'aucune ressource. Mais sa relation au WER dépend de la longueur typique des segments, qui varie selon la VAD et la langue. En valeur brute elle ne transfère pas ; normalisée par corpus (rang percentile), oui.
+
+## Le vrai enseignement
+
+Tes deux features les plus fortes en consensus — `oov_rate` et `perplexity` — sont aussi les deux moins réplicables. Tes deux plus robustes — `compression`, `hyp_words` — sont les plus faibles. C'est une tension que tu ne peux pas contourner : le signal linguistique est ce qui prédit le mieux *et* ce qui généralise le moins.
+
+Ça a une implication de conception directe : sépare tes features en deux groupes explicites.
+
+**Noyau agnostique** — `compression`, `hyp_words` normalisé, plus tout ce qui se calcule sans ressource externe (répétitions, ratio hypothèse/durée). Se réplique sur n'importe quelle langue sans rien préparer. C'est ton indicateur de base, celui que tu peux déployer partout.
+
+**Couche linguistique** — `oov_rate`, `perplexity`. Améliore le score quand tu as les ressources par langue, mais optionnelle. Un nouveau déploiement commence sans elle et l'ajoute si le gain le justifie.
+
+## Ce qu'il faut prévoir pour répliquer
+
+Pour un nouveau dataset, la checklist minimale :
+
+Le **format d'entrée** — ton pipeline suppose aujourd'hui des segments avec bornes temporelles et champ `channel`. Un nouveau dataset peut être segmenté autrement, ou pas du tout. Le noyau agnostique doit pouvoir tourner sur l'audio long découpé en fenêtres régulières, sans dépendre d'une VAD externe.
+
+La **normalisation par corpus** — puisque tu classes, pas ne prédis, tu normalises chaque feature en rang percentile *à l'intérieur* du nouveau corpus. C'est ce qui absorbe les décalages de langue, de VAD, de débit. Sans ça, `hyp_words` et `words_per_sec` ne transfèrent pas.
+
+Le **contrôle de convention** — l'affaire des chiffres t'a montré que deux modèles peuvent diverger sur le formatage. Sur un nouveau modèle ou une nouvelle langue, vérifie tôt que référence et hypothèse suivent les mêmes conventions (nombres, ponctuation, casse), sinon ton WER cible est pollué.
+
+Un **jeu de validation annoté minimal** — pour confirmer que le score corrèle sur le nouveau corpus, il te faut quelques appels avec WER connu. Pas pour entraîner (le score n'apprend rien), mais pour vérifier qu'il n'est pas cassé. Une dizaine d'appels suffit à détecter un effondrement, comme ici.
+
+## Ma recommandation de conception
+
+Construis le score en deux niveaux dès maintenant, pas un score monolithique. Un `score_core` sur les features agnostiques, un `score_full` qui ajoute la couche linguistique. Tu mesures les deux sur Pérou et Allemagne. Si `score_core` seul est déjà correct, tu as un indicateur qui se réplique sans aucune préparation par langue — ce qui est énorme pour ta contrainte de généralisation. Si la couche linguistique ajoute nettement, tu sais que le coût de préparer un lexique et un LM par langue est justifié.
+
+Ça répond à ta question avant même de tester : tu sauras exactement ce qu'un nouveau dataset exige, parce que la dépendance sera visible dans l'architecture du score plutôt que cachée dedans.
