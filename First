@@ -52,3 +52,12 @@ for feat in ["rms_db", "peak_db", "dynamic_range", "duration"]:
     rho, p = spearmanr(df[feat], df["wer"])
     print(f"  {feat:15s} rho={rho:+.3f}  p={p:.4f}")
 
+# agreement on the extremes — the actual use case is flagging the worst
+q = sub["wer_ft"].quantile(0.75)
+q_zs = sub["wer_zs"].quantile(0.75)
+hard_ft = sub["wer_ft"] >= q
+hard_zs = sub["wer_zs"] >= q_zs
+
+overlap = (hard_ft & hard_zs).sum()
+print(f"\nWorst quartile: {overlap}/{hard_ft.sum()} shared "
+      f"({100*overlap/hard_ft.sum():.0f}%, chance = 25%)")
