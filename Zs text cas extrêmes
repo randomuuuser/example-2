@@ -1,0 +1,45 @@
+from scipy.stats import spearmanr
+from sklearn.metrics import roc_auc_score
+
+def evaluate_extremes(df, score_col, target_col, exclude_middle=0.4):
+    """Correlation restricted to the clear-cut cases (Angle A).
+
+    Removes the middle band of the TARGET (not the score) where ranking is
+    noise, then measures correlation on the extremes.
+    """
+    lo = df[target_col].quantile(exclude_middle / 2)
+    hi = df[target_col].quantile(1 - exclude_middle / 2)
+    tails = df[(df[target_col] <= lo) | (df[target_col] >= hi)]
+    rho, p = spearmanr(tails[score_col], tails[target_col])
+    return rho, p, len(tails)
+
+
+def evaluate_flagging(df, score_col, target_col, hard_quantile=0.75, flag_rate=0.25):
+    """Detection metrics for the real use case (Angle B).
+
+    'Hard' = worst hard_quantile of true WER. 'Flagged' = worst flag_rate of score.
+    Reports how well the score catches the truly hard segments.
+    """
+    hard = df[target_col] >= df[target_col].quantile(hard_quantile)
+    flagged = df[score_col] >= df[score_col].quantile(1 - flag_rate)
+
+    tp = (hard & flagged).sum()
+    precision = tp / flagged.sum() if flagged.sum() else 0
+    recall = tp / hard.sum() if hard.sum() else 0
+    auc = roc_auc_score(hard, df[score_col])
+    return {"precision": precision, "recall": recall, "auc": auc,
+            "n_hard": int(hard.sum()), "n_flagged": int(flagged.sum())}
+
+
+
+
+print("=== Angle A: correlation on clear-cut cases ===")
+for excl in [0.0, 0.3, 0.5, 0.7]:
+    rho, p, n = evaluate_extremes(df_pe, "score_full", "wer_zs", exclude_middle=excl)
+    print(f"  exclude middle {excl:.0%}  ->  rho={rho:+.3f}  (n={n})")
+
+print("\n=== Angle B: flagging the hardest ===")
+m = evaluate_flagging(df_pe, "score_full", "wer_zs")
+print(f"  AUC={m['auc']:.3f}")
+print(f"  flagging worst 25%: precision={m['precision']:.2f}  recall={m['recall']:.2f}")
+print(f"  (chance precision would be {m['n_hard']/len(df_pe):.2f})")
