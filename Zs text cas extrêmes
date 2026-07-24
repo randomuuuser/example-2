@@ -1,15 +1,33 @@
-import numpy as np
 import pandas as pd
+import numpy as np
 from scipy.stats import spearmanr
-from sklearn.metrics import roc_auc_score
 
+
+# ============================================================
+# 1. Charger le WER par appel depuis tes deux JSON
+# ============================================================
+
+def load_wer_series(json_path):
+    """Charge le WER par appel : Series indexée par nom d'audio,
+    dernière ligne (moyenne) retirée."""
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    df = pd.DataFrame(data["WER"]["by_transcription"]).iloc[:-1]
+    return df[df.columns[0]]
+
+
+import json
+wer_ft = load_wer_series("wer_finetuned.json")   # <-- ton chemin réel
+wer_zs = load_wer_series("wer_zeroshot.json")     # <-- ton chemin réel
+
+
+# ============================================================
+# 2. Agréger les scores segment -> appel
+# ============================================================
 
 def aggregate_to_call(df_seg, score_col="score_full", weight_col="n_ref"):
-    """Aggregate segment-level scores to a call-level difficulty score.
-
-    A call is hard if it CONTAINS hard segments, so high percentiles and the
-    reference-word-weighted mean matter more than a plain mean.
-    """
+    """Un appel est difficile s'il CONTIENT des segments difficiles :
+    les percentiles hauts comptent plus que la moyenne."""
     rows = []
     for sid, g in df_seg.groupby("sample_id"):
         s = g[score_col].dropna()
@@ -28,20 +46,30 @@ def aggregate_to_call(df_seg, score_col="score_full", weight_col="n_ref"):
     return pd.DataFrame(rows).set_index("sample_id")
 
 
-
 call_scores = aggregate_to_call(df_pe, score_col="score_full")
 
-# attach the saved per-call WER — adapt keys to your index
-call_scores["wer_zs"] = [dict(data_wer_2).get(i) for i in call_scores.index]
-call_scores["wer_ft"] = [dict(data_wer_1).get(i) for i in call_scores.index]
+
+# ============================================================
+# 3. Rattacher le vrai WER par appel
+# ============================================================
+
+call_scores["wer_ft"] = call_scores.index.map(wer_ft.to_dict())
+call_scores["wer_zs"] = call_scores.index.map(wer_zs.to_dict())
 
 print(call_scores.round(3).to_string())
-print(f"\nNaN check:\n{call_scores[['wer_zs','wer_ft']].isna().sum()}")
+print(f"\nNaN check (doit etre 0):\n{call_scores[['wer_ft', 'wer_zs']].isna().sum()}")
+
+
+# ============================================================
+# 4. Corrélation par méthode d'agrégation
+# ============================================================
 
 AGG = ["score_mean", "score_wmean", "score_p75", "score_p90", "score_max"]
 print(f"\n{'aggregation':14s} {'rho_wer_zs':>12s} {'rho_wer_ft':>12s}")
 for agg in AGG:
     sub = call_scores[[agg, "wer_zs", "wer_ft"]].dropna()
+    if len(sub) < 5:
+        continue
     rho_zs = spearmanr(sub[agg], sub["wer_zs"])[0]
     rho_ft = spearmanr(sub[agg], sub["wer_ft"])[0]
     print(f"{agg:14s} {rho_zs:+12.3f} {rho_ft:+12.3f}")
