@@ -1,0 +1,21 @@
+def digit_convention(df):
+    """Compare digit usage between reference and hypothesis.
+
+    If digits appear in one but not the other, digit_ratio is measuring a
+    formatting mismatch rather than intrinsic difficulty.
+    """
+    ref_digits = df["ref"].str.count(r"\d") / df["ref"].str.len().clip(lower=1)
+    hyp_digits = df["hyp"].str.count(r"\d") / df["hyp"].str.len().clip(lower=1)
+    return pd.DataFrame({
+        "ref_digit_ratio": ref_digits.describe(),
+        "hyp_digit_ratio": hyp_digits.describe(),
+    })
+
+print(digit_convention(df).round(4))
+
+# does digit_ratio still predict WER on segments where BOTH sides use digits?
+both = df[(df["ref"].str.count(r"\d") > 0) & (df["hyp"].str.count(r"\d") > 0)]
+neither = df[(df["ref"].str.count(r"\d") == 0) & (df["hyp"].str.count(r"\d") == 0)]
+print(f"\nboth use digits: n={len(both)}, neither: n={len(neither)}")
+if len(both) > 30:
+    print(f"rho on 'both' subset: {spearmanr(both['digit_ratio'], both['wer_ft'])[0]:+.3f}")
