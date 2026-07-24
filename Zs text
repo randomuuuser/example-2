@@ -1,151 +1,81 @@
-import gzip
 import re
-from collections import Counter
+import unicodedata
 
 
-def compression_ratio(text):
-    """Whisper's degeneration heuristic. High = repetitive output."""
-    if len(text) < 10:
-        return None
-    raw = text.encode("utf-8")
-    return len(raw) / len(gzip.compress(raw))
+def normalize_text(text):
+    """Lowercase, strip accents, remove punctuation, collapse whitespace.
 
-
-def repetition_rate(words, n=3):
-    """Fraction of n-grams that are duplicates."""
-    if len(words) < n + 1:
-        return 0.0
-    grams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
-    counts = Counter(grams)
-    return 1.0 - len(counts) / len(grams)
-
-
-def text_features(hypothesis, duration):
-    """Features computable from any ASR output, no model internals needed."""
-    words = normalize_text(hypothesis).split()
-    n = len(words)
-    if n == 0:
-        return {
-            "hyp_words": 0, "words_per_sec": 0.0, "compression": None,
-            "repetition_3g": 0.0, "repetition_2g": 0.0,
-            "mean_word_len": 0.0, "digit_ratio": 0.0, "short_word_ratio": 0.0,
-        }
-    return {
-        "hyp_words": n,
-        "words_per_sec": n / max(duration, 1e-6),
-        "compression": compression_ratio(hypothesis),
-        "repetition_3g": repetition_rate(words, 3),
-        "repetition_2g": repetition_rate(words, 2),
-        "mean_word_len": float(np.mean([len(w) for w in words])),
-        "digit_ratio": sum(c.isdigit() for c in hypothesis) / max(len(hypothesis), 1),
-        "short_word_ratio": sum(len(w) <= 2 for w in words) / n,
-    }
+    Must stay consistent with the transforms used for WER computation.
+    """
+    text = text.lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 
+def evaluate_features(df, features, targets=("wer_ft", "wer_zs", "difficulty"),
+                      consensus_col="consensus", min_n=30):
+    """Spearman correlation of each feature against each target.
+
+    Also reports the correlation restricted to consensus segments, where both
+    models agree on the difficulty tercile — the subset where an intrinsic
+    (model-agnostic) signal can be demonstrated.
+
+    Returns a DataFrame indexed by feature.
+    """
+    records = []
+    for feat in features:
+        cols = [feat, *targets]
+        if consensus_col in df.columns:
+            cols.append(consensus_col)
+        sub = df[cols].dropna(subset=[feat, *targets])
+        if len(sub) < min_n:
+            continue
+
+        rec = {"feature": feat, "n": len(sub)}
+        for target in targets:
+            rho, p = spearmanr(sub[feat], sub[target])
+            rec[f"rho_{target}"] = rho
+            rec[f"p_{target}"] = p
+
+        if consensus_col in sub.columns:
+            cons = sub[sub[consensus_col]]
+            if len(cons) >= min_n:
+                rho, p = spearmanr(cons[feat], cons["difficulty"])
+                rec["rho_consensus"] = rho
+                rec["p_consensus"] = p
+                rec["n_consensus"] = len(cons)
+
+        records.append(rec)
+
+    out = pd.DataFrame(records).set_index("feature")
+    return out.reindex(out["rho_wer_ft"].abs().sort_values(ascending=False).index)
+
+FEATURES = [
+    "compression", "repetition_3g", "repetition_2g", "words_per_sec",
+    "hyp_words", "mean_word_len", "digit_ratio", "short_word_ratio",
+    "perplexity", "oov_rate",
+]
+
+results_pe = evaluate_features(df, FEATURES)
+results_pe.round(3)
 
 
+def compare_corpora(results_by_corpus, target="rho_wer_ft"):
+    """Side-by-side view of one target across corpora.
+
+    A feature is retained only if it holds on both — this is the
+    cross-corpus filter that guards against language-specific artifacts.
+    """
+    merged = pd.DataFrame({
+        name: res[target] for name, res in results_by_corpus.items()
+    })
+    merged["min_abs"] = merged.abs().min(axis=1)
+    merged["sign_agree"] = (np.sign(merged.iloc[:, 0]) == np.sign(merged.iloc[:, 1]))
+    return merged.sort_values("min_abs", ascending=False)
 
 
-
-
-def train_trigram(texts, alpha=0.4):
-    """Simple back-off trigram over in-domain reference text."""
-    uni, bi, tri = Counter(), Counter(), Counter()
-    for t in texts:
-        w = ["<s>", "<s>"] + normalize_text(t).split() + ["</s>"]
-        uni.update(w)
-        bi.update(zip(w, w[1:]))
-        tri.update(zip(w, w[1:], w[2:]))
-    return {"uni": uni, "bi": bi, "tri": tri, "total": sum(uni.values()), "alpha": alpha}
-
-
-def perplexity(lm, text):
-    """Stupid-backoff perplexity. Language-dependent: one LM per corpus."""
-    w = ["<s>", "<s>"] + normalize_text(text).split() + ["</s>"]
-    if len(w) <= 3:
-        return None
-    a, logp = lm["alpha"], 0.0
-    for i in range(2, len(w)):
-        c3 = lm["tri"].get((w[i-2], w[i-1], w[i]), 0)
-        c2 = lm["bi"].get((w[i-2], w[i-1]), 0)
-        if c3 > 0 and c2 > 0:
-            p = c3 / c2
-        else:
-            c2b = lm["bi"].get((w[i-1], w[i]), 0)
-            c1 = lm["uni"].get(w[i-1], 0)
-            if c2b > 0 and c1 > 0:
-                p = a * c2b / c1
-            else:
-                p = a * a * (lm["uni"].get(w[i], 0) + 1) / (lm["total"] + len(lm["uni"]))
-        logp += np.log(max(p, 1e-10))
-    return float(np.exp(-logp / (len(w) - 2)))
-
-
-def oov_rate(vocab, text):
-    words = normalize_text(text).split()
-    if not words:
-        return 0.0
-    return sum(w not in vocab for w in words) / len(words)
-
-# hypothesis text per segment — reuse the overlap matching from wer_per_segment
-rows = []
-for sample_id, sample in samples.items():
-    pred_segs = extract_segments(sample, "prediction")
-    for gt in extract_segments(sample, "label"):
-        hyp_parts = []
-        for p in pred_segs:
-            if p["channel"] != gt["channel"]:
-                continue
-            if min(gt["end_time"], p["end_time"]) - max(gt["start_time"], p["start_time"]) > 0:
-                hyp_parts.append((p["start_time"], p["text"]))
-        hyp_parts.sort()
-        rows.append({
-            "sample_id": sample_id,
-            "start_time": gt["start_time"],
-            "ref": gt["text"],
-            "hyp": " ".join(t for _, t in hyp_parts),
-            "duration": gt["end_time"] - gt["start_time"],
-        })
-
-df_txt = pd.DataFrame(rows)
-# merge onto df_seg by (sample_id, start_time) to attach wer_ft / wer_zs / difficulty
-df = df_seg.merge(df_txt, on=["sample_id", "start_time"], how="inner")
-df = df[df["n_ref"] >= 10].reset_index(drop=True)
-
-# text features
-feats = pd.DataFrame([text_features(r["hyp"], r["duration"]) for _, r in df.iterrows()])
-df = pd.concat([df.reset_index(drop=True), feats], axis=1)
-
-# LM features, leave-one-call-out
-ppl, oov = [], []
-for i, row in df.iterrows():
-    train_texts = df.loc[df["sample_id"] != row["sample_id"], "ref"]
-    lm = train_trigram(train_texts)
-    vocab = set(" ".join(train_texts).lower().split())
-    ppl.append(perplexity(lm, row["hyp"]))
-    oov.append(oov_rate(vocab, row["hyp"]))
-df["perplexity"] = ppl
-df["oov_rate"] = oov
-
-
-
-
-
-
-FEATURES = ["compression", "repetition_3g", "repetition_2g", "words_per_sec",
-            "hyp_words", "mean_word_len", "digit_ratio", "short_word_ratio",
-            "perplexity", "oov_rate"]
-
-print(f"{len(df)} segments\n")
-print(f"{'feature':18s} {'wer_ft':>9s} {'wer_zs':>9s} {'difficulty':>11s} {'consensus':>11s}")
-for f in FEATURES:
-    sub = df[[f, "wer_ft", "wer_zs", "difficulty", "consensus"]].dropna()
-    if len(sub) < 30:
-        continue
-    r1 = spearmanr(sub[f], sub["wer_ft"])[0]
-    r2 = spearmanr(sub[f], sub["wer_zs"])[0]
-    r3 = spearmanr(sub[f], sub["difficulty"])[0]
-    c = sub[sub["consensus"]]
-    r4 = spearmanr(c[f], c["difficulty"])[0] if len(c) > 30 else float("nan")
-    print(f"{f:18s} {r1:+9.3f} {r2:+9.3f} {r3:+11.3f} {r4:+11.3f}")
+comparison = compare_corpora({"peru": results_pe, "germany": results_de})
+comparison.round(3)
