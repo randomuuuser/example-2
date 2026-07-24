@@ -1,9 +1,0 @@
-# keep the continuous target for feature validation
-# discretize only at the very end, for the user-facing output
-
-# 1. does the feature correlate with the shared difficulty at all?
-rho_all, p_all = spearmanr(df["feature"], df["difficulty"])
-
-# 2. does it correlate better where the two models agree?
-consensus = df[df["consensus"]]
-rho_cons, p_cons = spearmanr(consensus["feature"], consensus["difficulty"])
