@@ -1,96 +1,39 @@
-
-
-import numpy as np
-import pandas as pd
-from scipy.stats import spearmanr
-
-
-# --- Core features: fully language-agnostic, no external resource ---
-
-CORE_FEATURES = ["compression", "hyp_words", "repetition_2g", "words_per_sec"]
-
-# --- Linguistic layer: needs a per-language lexicon / LM ---
-
-LING_FEATURES = ["oov_rate", "perplexity"]
-
-
 def to_rank(series):
-    """Percentile rank within the corpus. Neutralizes level shifts across
-    language, VAD, model — the key to cross-corpus transfer."""
-    return series.rank(pct=True)
+    """Percentile rank within the corpus, NaN-safe.
 
-
-def build_score(df, features, weights=None):
-    """Combine features into a difficulty score in [0, 1].
-
-    Each feature is turned into a percentile rank, sign-aligned so that higher
-    always means harder, then averaged. No weights are learned — with ~500
-    points and correlated features, a fixed average is more honest than a
-    fitted model and transfers without retraining.
+    NaN values get the neutral rank 0.5 rather than poisoning the average.
     """
+    r = series.rank(pct=True)
+    return r.fillna(0.5)
+
+
+def build_score(df, features, sign, weights=None):
+    """Combine features into a difficulty score in [0, 1]. NaN-safe."""
     ranks = []
+    used_weights = []
     for f in features:
+        if f not in df.columns:
+            continue
         r = to_rank(df[f])
-        # align sign: features negatively correlated with difficulty get flipped
-        if SIGN[f] < 0:
+        if sign[f] < 0:
             r = 1.0 - r
-        ranks.append(r * (weights[f] if weights else 1.0))
-    total_w = sum(weights.values()) if weights else len(features)
-    return sum(ranks) / total_w
+        w = weights[f] if weights else 1.0
+        ranks.append(r * w)
+        used_weights.append(w)
+    if not ranks:
+        raise ValueError("no usable features")
+    return sum(ranks) / sum(used_weights)
 
 
-# sign of each feature's correlation with difficulty, from the validation tables
-SIGN = {
-    "compression": +1,
-    "hyp_words": +1,
-    "repetition_2g": +1,
-    "words_per_sec": -1,
-    "oov_rate": +1,
-    "perplexity": +1,
-}
-
-
-
-
-def evaluate_score(df, targets, label=""):
-    """Score both levels and report Spearman against each target."""
-    df = df.copy()
-    df["score_core"] = build_score(df, CORE_FEATURES)
-
-    ling_available = [f for f in LING_FEATURES if f in df.columns and df[f].notna().any()]
-    if ling_available:
-        df["score_full"] = build_score(df, CORE_FEATURES + ling_available)
-
-    print(f"=== {label} ===")
-    for target in targets:
-        sub = df[df[target].notna()]
-        rho_core = spearmanr(sub["score_core"], sub[target])[0]
-        line = f"  {target:12s}  core={rho_core:+.3f}"
-        if "score_full" in df.columns:
-            rho_full = spearmanr(sub["score_full"], sub[target])[0]
-            line += f"  full={rho_full:+.3f}"
-        print(line)
-    return df
+for f in CORE_FEATURES + LING_FEATURES:
+    if f in df_peru.columns:
+        n_nan = df_peru[f].isna().sum()
+        print(f"{f:15s} NaN={n_nan:4d}  dtype={df_peru[f].dtype}")
+    else:
+        print(f"{f:15s} ABSENTE de df_peru")
 
 
 
-# Peru: has both models -> can use consensus
-df_pe = evaluate_score(
-    df_peru,
-    targets=["wer_zs", "difficulty"],
-    label="Peru (segment level)",
-)
-
-# consensus subset — the model-agnostic validation
-cons = df_pe[df_pe["consensus"]]
-print(f"\n  consensus subset (n={len(cons)}):")
-print(f"    core={spearmanr(cons['score_core'], cons['difficulty'])[0]:+.3f}", end="")
-if "score_full" in cons.columns:
-    print(f"  full={spearmanr(cons['score_full'], cons['difficulty'])[0]:+.3f}")
-
-# Germany: 0-shot only, no finetuned, no consensus
-df_de = evaluate_score(
-    df_germany,
-    targets=["wer_zs"],
-    label="Germany (segment level)",
-)
+df["score_core"] = build_score(df, CORE_FEATURES, SIGN)
+# ...
+df["score_full"] = build_score(df, CORE_FEATURES + ling_available, SIGN)
