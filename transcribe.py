@@ -270,16 +270,3 @@ def run_all(records, out_dir, systems=None):
         results[role] = {sid: row["text"] for sid, row in cache.items()}
 
     return results
-
-
-
-
-
-
-# ------------------- Usage
-records, stats, failures = prepare_corpus(
-    "testset.json", lang="es", out_dir="data/peru",
-    audio_root="/chemin/racine", min_ref_words=10)
-
-sanity_check_canary(records)          # <- à faire AVANT tout le reste
-results = run_all(records, "data/peru/asr")
