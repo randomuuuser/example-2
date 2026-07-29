@@ -36,7 +36,32 @@ import wave
 
 import numpy as np
 
+from text_norm import normalize_text
+
 TARGET_SR = 16000
+
+# Normalization settings, frozen once per corpus and persisted next to the
+# data. Every later step reloads them, which is what guarantees that the
+# reference and all three hypotheses went through the exact same function.
+DEFAULT_NORM = {"strip_accents": False, "expand_numbers": True}
+NORM_CONFIG_NAME = "norm_config.json"
+
+
+def write_norm_config(out_dir, norm_config):
+    """Persist the normalization settings inside the corpus directory."""
+    path = os.path.join(out_dir, NORM_CONFIG_NAME)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(norm_config, handle, indent=1)
+    return path
+
+
+def read_norm_config(out_dir):
+    """Reload the settings that were used to prepare this corpus."""
+    path = os.path.join(out_dir, NORM_CONFIG_NAME)
+    if not os.path.exists(path):
+        return dict(DEFAULT_NORM)
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 # --------------------------------------------------------------------------
@@ -133,7 +158,7 @@ def extract_segment(call_audio, sr, start_time, end_time, channel_index,
 # --------------------------------------------------------------------------
 
 def read_segments(json_path, lang, min_ref_words=10, roles=None,
-                  source="label"):
+                  source="label", norm_config=None):
     """
     Flatten the test-set JSON into one record per annotated segment.
 
@@ -142,7 +167,11 @@ def read_segments(json_path, lang, min_ref_words=10, roles=None,
         lang: corpus language code ('es', 'de'), applied to every record.
         min_ref_words: drop shorter references. On a 3-word segment the WER
             only takes a handful of discrete values, which is metric noise
-            rather than signal.
+            rather than signal. Counted on the NORMALIZED reference, because
+            that is what will sit in the WER denominator: in Spanish
+            'son 1234 soles' is 3 raw words but 7 normalized ones.
+        norm_config: kwargs forwarded to normalize_text. Frozen here and
+            persisted, so every later step reuses the identical settings.
         roles: keep only these speaker_role values (e.g. {'Client'}).
         source: 'label' for the human segmentation, 'prediction' to inspect
             the pre-existing ASR one.
@@ -150,6 +179,8 @@ def read_segments(json_path, lang, min_ref_words=10, roles=None,
     Returns:
         (records, stats) where stats counts what was dropped and why.
     """
+    norm_config = dict(DEFAULT_NORM if norm_config is None else norm_config)
+
     with open(json_path, encoding="utf-8") as handle:
         data = json.load(handle)
 
@@ -179,7 +210,9 @@ def read_segments(json_path, lang, min_ref_words=10, roles=None,
             if end_time <= start_time:
                 stats["bad_span"] += 1
                 continue
-            if len(text.split()) < min_ref_words:
+            reference_norm = normalize_text(text, lang, **norm_config)
+            n_ref_words = len(reference_norm.split())
+            if n_ref_words < min_ref_words:
                 stats["too_short"] += 1
                 continue
 
@@ -196,6 +229,8 @@ def read_segments(json_path, lang, min_ref_words=10, roles=None,
                 "end_time": end_time,
                 "duration": round(end_time - start_time, 3),
                 "reference": text,
+                "reference_norm": reference_norm,
+                "n_ref_words": n_ref_words,
                 "lang": lang,
             })
             stats["kept"] += 1
@@ -294,10 +329,15 @@ def read_records(path):
 
 
 def prepare_corpus(json_path, lang, out_dir, audio_root="",
-                   min_ref_words=10, roles=None):
-    """Run the whole block: parse, cut, export, write manifest."""
+                   min_ref_words=10, roles=None, norm_config=None):
+    """Run the whole block: parse, normalize, cut, export, write manifest."""
+    os.makedirs(out_dir, exist_ok=True)
+    norm_config = dict(DEFAULT_NORM if norm_config is None else norm_config)
+    write_norm_config(out_dir, norm_config)
+
     records, stats = read_segments(
-        json_path, lang, min_ref_words=min_ref_words, roles=roles
+        json_path, lang, min_ref_words=min_ref_words, roles=roles,
+        norm_config=norm_config,
     )
     records, failures = export_segments(records, os.path.join(out_dir, "wav"),
                                         audio_root)
