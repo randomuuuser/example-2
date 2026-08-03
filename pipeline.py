@@ -208,3 +208,105 @@ def to_frame(rows):
     import pandas as pd
 
     return pd.DataFrame(rows)
+
+
+
+
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+BNP_GREEN, BNP_DARK, GREY, CAPTION = "#00915A", "#00674B", "#B0B7BC", "#5A6468"
+
+
+def plot_ridge(table, n=12, path=None):
+    """Horizontal bar chart of the ridge coefficients, with fold variability."""
+    df = pd.DataFrame(table).head(n).iloc[::-1]      # reversed: largest on top
+    fig, ax = plt.subplots(figsize=(8, 0.42 * len(df) + 1.4))
+    colors = [BNP_GREEN if c > 0 else GREY for c in df["coef"]]
+    ax.barh(df["feature"], df["coef"], xerr=df["std"], color=colors,
+            error_kw={"ecolor": BNP_DARK, "capsize": 3, "lw": 1})
+    ax.axvline(0, color=BNP_DARK, lw=0.8)
+    ax.set_xlabel("Standardised coefficient (Δ predicted WER per 1 SD)")
+    ax.set_title("Linear contribution of each feature to the estimated WER",
+                 loc="left", fontweight="bold", pad=12)
+    ax.text(0, 1.02, "Ridge regression, coefficients averaged over 5 call-grouped "
+                     "folds; bars show ±1 SD",
+            transform=ax.transAxes, fontsize=8.5, color=CAPTION)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(left=False)
+    ax.grid(axis="x", alpha=0.25, lw=0.6)
+    fig.tight_layout()
+    if path:
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+    return fig
+
+
+def plot_pdp(curve, feature, path=None):
+    """Partial dependence curve for one feature."""
+    df = pd.DataFrame(curve)
+    fig, ax = plt.subplots(figsize=(7.5, 4.2))
+    ax.plot(df["value"], df["predicted"], color=BNP_GREEN, lw=2.2,
+            marker="o", ms=4.5, mfc="white", mec=BNP_GREEN, mew=1.6)
+    ax.set_xlabel(feature.replace("_", " "))
+    ax.set_ylabel("Estimated WER")
+    ax.set_title(f"Effect of {feature.replace('_', ' ')} on the estimated WER",
+                 loc="left", fontweight="bold", pad=12)
+    ax.text(0, 1.02, "Partial dependence of the gradient boosting model, all "
+                     "other features held at their observed distribution",
+            transform=ax.transAxes, fontsize=8.5, color=CAPTION)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.grid(alpha=0.25, lw=0.6)
+    fig.tight_layout()
+    if path:
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+    return fig
+
+
+def plot_importance_comparison(permutation_scores, xgb_gains, n=10, path=None):
+    """
+    Permutation importance next to XGBoost gain, both normalised to their max.
+
+    The two disagree by construction: permutation gives ~0 to correlated
+    interchangeable features, gain splits credit among them. Showing them side
+    by side is more honest than picking one.
+    """
+    perm = {name: delta for name, delta, _ in permutation_scores}
+    gain = {row["feature"]: row["gain"] for row in xgb_gains}
+    order = sorted(perm, key=lambda k: -perm[k])[:n][::-1]
+
+    perm_max = max(perm.values()) or 1
+    gain_max = max(gain.values()) or 1
+    y = range(len(order))
+    fig, ax = plt.subplots(figsize=(8.5, 0.5 * len(order) + 1.6))
+    ax.barh([i + 0.2 for i in y], [perm[f] / perm_max for f in order],
+            height=0.38, color=BNP_GREEN, label="Permutation (out-of-fold)")
+    ax.barh([i - 0.2 for i in y], [gain.get(f, 0) / gain_max for f in order],
+            height=0.38, color=GREY, label="XGBoost gain (in-sample)")
+    ax.set_yticks(list(y))
+    ax.set_yticklabels(order)
+    ax.set_xlabel("Relative importance (normalised to the maximum)")
+    ax.set_title("Feature importance: out-of-fold impact versus in-sample gain",
+                 loc="left", fontweight="bold", pad=12)
+    ax.text(0, 1.02, "Divergence is expected: permutation discounts correlated "
+                     "features, gain distributes credit among them",
+            transform=ax.transAxes, fontsize=8.5, color=CAPTION)
+    ax.legend(frameon=False, loc="lower right", fontsize=9)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(left=False)
+    ax.grid(axis="x", alpha=0.25, lw=0.6)
+    fig.tight_layout()
+    if path:
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+    return fig
+
+
+# plot_ridge(ridge_coefficients(rows), path="ridge_coefficients.png")
+# plot_pdp(partial_dependence_curve(rows, "words_per_second"),
+#          "words_per_second", path="pdp_words_per_second.png")
+
+# base_mae, perm = permutation_importance(rows, target="wer", n_repeats=3)
+# plot_importance_comparison(perm, xgb_importances(rows), path="importance.png")
