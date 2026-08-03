@@ -43,6 +43,15 @@ def make_model(name="hgb", seed=0):
             min_samples_leaf=20, l2_regularization=1.0,
             early_stopping=False, random_state=seed,
         )
+    if name == "xgb": ## NEW
+        from xgboost import XGBRegressor
+
+        return XGBRegressor(
+            max_depth=3, n_estimators=200, learning_rate=0.05,
+            min_child_weight=20, reg_lambda=1.0, subsample=0.8,
+            colsample_bytree=0.8, objective="reg:absoluteerror",
+            importance_type="gain", random_state=seed, n_jobs=-1,
+        )
     if name == "ridge":
         return make_pipeline(StandardScaler(), Ridge(alpha=1.0))
     if name == "dummy":
@@ -364,4 +373,10 @@ def partial_dependence_curve(rows, feature, blocks=("proxy", "text"),
             for v, p in zip(result["grid_values"][0], result["average"][0])]
 
 
-
+def xgb_importances(rows, blocks=("proxy", "text"), target="wer", seed=0):
+    """Native gain-based importances of an XGBoost model fitted on all rows."""
+    X, y, groups, names = _matrix(rows, blocks, target)
+    model = make_model("xgb", seed).fit(X, y)
+    table = sorted(zip(names, model.feature_importances_),
+                   key=lambda item: -item[1])
+    return [{"feature": n, "gain": round(float(g), 4)} for n, g in table]
