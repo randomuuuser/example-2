@@ -292,3 +292,76 @@ def permutation_importance(rows, blocks=("proxy", "text"), target="errors",
 
     scores.sort(key=lambda item: -item[1])
     return base_mae, scores
+
+
+
+
+
+
+import numpy as np
+from evaluate import cross_validate, make_model, select_blocks, splitter
+from features import PROXY_ROLES, build_features
+from sklearn.inspection import partial_dependence
+
+
+def _matrix(rows, blocks, target, roles=PROXY_ROLES):
+    """Feature matrix, target vector and groups, as used by cross_validate."""
+    X, y_errors, y_wer, groups, names = build_features(rows, roles=roles)
+    X, used = select_blocks(X, names, blocks)
+    y = np.asarray(y_errors if target == "errors" else y_wer, dtype=float)
+    return np.asarray(X), y, np.asarray(groups), used
+
+
+def ridge_coefficients(rows, blocks=("proxy", "text"), target="wer", n_splits=5):
+    """
+    Ridge coefficients, refitted per fold and averaged.
+
+    Features are standardized inside the pipeline, so coefficients compare
+    directly: each is the change in predicted WER for a one-standard-deviation
+    change in that feature. Fitting per fold gives the across-fold std - a
+    coefficient whose std exceeds its mean is not a finding.
+    """
+    X, y, groups, names = _matrix(rows, blocks, target)
+    cv = splitter(groups, n_splits)
+
+    coefficients = []
+    for train_index, _ in cv.split(X, y, groups):
+        model = make_model("ridge").fit(X[train_index], y[train_index])
+        coefficients.append(model[-1].coef_)      # [-1] = Ridge, [0] = scaler
+    coefficients = np.array(coefficients)
+
+    table = [
+        {"feature": name,
+         "coef": round(float(coefficients[:, j].mean()), 4),
+         "std": round(float(coefficients[:, j].std()), 4),
+         "stable": bool(abs(coefficients[:, j].mean()) > coefficients[:, j].std())}
+        for j, name in enumerate(names)
+    ]
+    table.sort(key=lambda item: -abs(item["coef"]))
+    return table
+
+
+def partial_dependence_curve(rows, feature, blocks=("proxy", "text"),
+                             target="wer", n_points=10, seed=0):
+    """
+    Shape of one feature's effect on the HGB prediction.
+
+    Permutation importance says HOW MUCH a feature matters; this says IN WHICH
+    DIRECTION and WITH WHAT SHAPE. HistGradientBoostingRegressor has no
+    feature_importances_ attribute, so these two together are the full toolkit.
+    """
+    from sklearn.inspection import partial_dependence
+
+    X, y, groups, names = _matrix(rows, blocks, target)
+    if feature not in names:
+        raise ValueError(f"unknown feature: {feature}")
+
+    model = make_model("hgb", seed).fit(X, y)
+    result = partial_dependence(model, X, [names.index(feature)],
+                                grid_resolution=n_points, kind="average")
+
+    return [{"value": round(float(v), 4), "predicted": round(float(p), 4)}
+            for v, p in zip(result["grid_values"][0], result["average"][0])]
+
+
+
