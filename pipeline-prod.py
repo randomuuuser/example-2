@@ -379,3 +379,11 @@ def rank(bundle, rows):
     table = pd.DataFrame(predict_calls(bundle, rows))
     print(table.to_string(index=False))
     return table
+
+
+## notebook feature importance
+import pandas as pd
+rows = pl.load_table(local_dir_results)
+
+pd.DataFrame(ridge_coefficients(rows)).head(15)
+pd.DataFrame(partial_dependence_curve(rows, "words_per_second"))
