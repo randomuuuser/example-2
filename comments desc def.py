@@ -1323,3 +1323,73 @@ Returns:
     Estimated WER for each call.
 """
 ```
+
+
+
+
+
+
+**`read_segments`** — c'est le piège le plus concret, on a déjà corrigé ce bug une fois :
+```python
+    min_ref_words: Minimum reference length, counted on the NORMALIZED
+        reference (number expansion changes the count: "son 1234 soles"
+        is 3 raw words but 7 normalized ones).
+```
+
+**`proxy_features`** — sans ça, `pdel` et `pins` s'interprètent à l'envers :
+```python
+    Note:
+        Direction convention: the proxy is the pseudo-reference and the target
+        is the hypothesis, i.e. wer_counts(proxy, target). A deletion means the
+        target dropped a word the proxy produced.
+```
+
+**`cross_validate`** — le cœur de la défense méthodologique :
+```python
+    Note:
+        Grouping is by CALL: segments of one call share speaker, channel and
+        line quality, so a random split would leak. The same algorithm is
+        refitted independently on each fold; each row is predicted exactly once,
+        by the fold model that held it out. No ensembling, no averaging.
+```
+
+**`predict`** — comportement non évident (ça lève une exception) :
+```python
+    Raises:
+        ValueError: if norm_config differs from the one used at training time.
+            A pWER computed under different conventions is not the feature the
+            model was fitted on, and the failure would otherwise be silent.
+```
+
+**`entries_to_matrix`** :
+```python
+    Note:
+        Column order comes from the bundle, never rebuilt from the data:
+        rebuilding would silently shuffle columns whenever a proxy is missing
+        on some segments.
+```
+
+**`fit_final`** :
+```python
+    Note:
+        Fitted on ALL rows; this is the deployment artifact. The honest
+        performance estimate remains the cross-validated score, not any metric
+        computed on this model's own training data.
+```
+
+## Les ajouts utiles mais secondaires
+
+**`normalize_text`** — `Note: reference and every hypothesis must go through this function with the identical config; asymmetry turns a spelling convention into a false recognition error.`
+
+**`_strip_accents`** — `Note: German transliterates umlauts (ö→oe) rather than stripping them, since systems disagree on spelling, not on the diacritic.`
+
+**`make_model`** — `Note: hyperparameters are constrained for ~1k rows. early_stopping is off on purpose: its internal split is random and would break the call grouping.`
+
+**`denominator_bias`** — `Note: a high ratio_p90 is the most sensitive signal that the target system produces degenerate (near-empty) output.`
+
+**`sanity_check_canary`** — `Note: run before the full transcription. Check each hypothesis is in the same language as its reference; a language misconfiguration costs 30 seconds here and a GPU-hour later.`
+
+**`load_call`** — `Note: the whole call is decoded once and sliced in memory; mp3 seeking is imprecise and per-segment ffmpeg calls are far costlier.`
+
+**`hypothesis_text`** — `Note: NeMo returns plain strings, Hypothesis objects or tuples depending on the version.`
+
