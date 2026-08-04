@@ -4,6 +4,23 @@
 """
 High-level pipeline for dataset preparation, transcription, feature extraction,
 model evaluation, and deployment.
+
+Usage
+    records = pl.prepare(json_path, lang="es", out_dir=..., audio_root=...)
+    pl.sanity(records)                          
+    pl.transcribe(records, out_dir, ["target"])
+    pl.accents(records, out_dir)                
+    pl.transcribe(records, out_dir)             #  proxies
+    rows = pl.merge(records, out_dir)
+    
+    # analyse
+    pl.ablate(rows, target="wer")
+    pl.compare_proxies(rows)
+    pl.evaluate(rows, target="wer")
+    
+    # deployement
+    bundle = pl.fit(rows, out_dir=...)
+    pl.rank(bundle, nouvelles_lignes)
 """
 ```
 
