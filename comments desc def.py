@@ -1,3 +1,343 @@
+# pipeline.py
+
+```python
+"""
+High-level pipeline for dataset preparation, transcription, feature extraction,
+model evaluation, and deployment.
+"""
+```
+
+### `report(title, pairs)`
+```python
+"""
+Display a formatted summary.
+
+Args:
+    title: Report title.
+    pairs: Key-value pairs to display.
+
+Returns:
+    None.
+"""
+```
+
+### `load(out_dir)`
+```python
+"""
+Load the prepared dataset.
+
+Args:
+    out_dir: Output directory.
+
+Returns:
+    Prepared records.
+"""
+```
+
+### `prepare(...)`
+```python
+"""
+Prepare the dataset for ASR transcription.
+
+Args:
+    json_path: Dataset annotation file.
+    lang: Language code.
+    out_dir: Output directory.
+    audio_root: Root audio directory.
+    min_ref_words: Minimum reference length.
+    roles: Speaker roles to include.
+    strip_accents: Whether to remove diacritics.
+    expand_numbers: Whether to expand numbers into words.
+
+Returns:
+    Prepared records.
+"""
+```
+
+### `sanity(records, model="nvidia/canary-180m-flash", n_per_lang=20)`
+```python
+"""
+Run a sanity check on the ASR model.
+
+Args:
+    records: Prepared records.
+    model: ASR model.
+    n_per_lang: Number of samples per language.
+
+Returns:
+    Sample transcriptions.
+"""
+```
+
+### `transcribe(records, out_dir, systems=None)`
+```python
+"""
+Run ASR transcription.
+
+Args:
+    records: Prepared records.
+    out_dir: Output directory.
+    systems: ASR systems to execute.
+
+Returns:
+    Transcription results.
+"""
+```
+
+### `accents(records, out_dir, min_delta=0.005)`
+```python
+"""
+Evaluate the impact of accent normalization.
+
+Args:
+    records: Prepared records.
+    out_dir: Output directory.
+    min_delta: Minimum WER improvement threshold.
+
+Returns:
+    Accent normalization recommendations.
+"""
+```
+
+### `merge(records, out_dir)`
+```python
+"""
+Merge transcriptions and generate WER labels.
+
+Args:
+    records: Prepared records.
+    out_dir: Output directory.
+
+Returns:
+    Merged dataset.
+"""
+```
+
+### `status(out_dir)`
+```python
+"""
+Summarize the current pipeline status.
+
+Args:
+    out_dir: Output directory.
+
+Returns:
+    Status information.
+"""
+```
+
+### `to_frame(rows)`
+```python
+"""
+Convert records into a pandas DataFrame.
+
+Args:
+    rows: Input records.
+
+Returns:
+    DataFrame.
+"""
+```
+
+### `load_table(out_dir)`
+```python
+"""
+Load the merged analysis table.
+
+Args:
+    out_dir: Output directory.
+
+Returns:
+    Merged records.
+"""
+```
+
+### `ablate(rows, target="wer", n_splits=5)`
+```python
+"""
+Run feature ablation experiments.
+
+Args:
+    rows: Input records.
+    target: Prediction target.
+    n_splits: Number of cross-validation folds.
+
+Returns:
+    Ablation results.
+"""
+```
+
+### `evaluate(rows, target="wer", model="hgb", blocks=("proxy", "text"), n_splits=5, importance=True)`
+```python
+"""
+Evaluate a WER prediction model.
+
+Args:
+    rows: Input records.
+    target: Prediction target.
+    model: Regression model.
+    blocks: Feature blocks to include.
+    n_splits: Number of cross-validation folds.
+    importance: Whether to compute feature importance.
+
+Returns:
+    Evaluation results.
+"""
+```
+
+### `compare_proxies(rows, target="wer", n_splits=5)`
+```python
+"""
+Compare different proxy ASR configurations.
+
+Args:
+    rows: Input records.
+    target: Prediction target.
+    n_splits: Number of cross-validation folds.
+
+Returns:
+    Proxy comparison results.
+"""
+```
+
+### `diagnose(rows, min_hyp_words=3)`
+```python
+"""
+Run diagnostic analyses on the dataset.
+
+Args:
+    rows: Input records.
+    min_hyp_words: Minimum hypothesis length.
+
+Returns:
+    None.
+"""
+```
+
+### `worst(rows, n=10)`
+```python
+"""
+Display the worst prediction examples.
+
+Args:
+    rows: Input records.
+    n: Number of examples.
+
+Returns:
+    Prediction analysis.
+"""
+```
+
+### `tail(rows)`
+```python
+"""
+Analyze the distribution of WER labels.
+
+Args:
+    rows: Input records.
+
+Returns:
+    Label distribution statistics.
+"""
+```
+
+### `clipped(rows, max_wer=1.0)`
+```python
+"""
+Clip WER labels above a threshold.
+
+Args:
+    rows: Input records.
+    max_wer: Maximum WER value.
+
+Returns:
+    Updated records.
+"""
+```
+
+### `fit(rows, out_dir=None, target="wer", model="hgb", blocks=("proxy", "text"), notes="")`
+```python
+"""
+Train the final WER prediction model.
+
+Args:
+    rows: Training records.
+    out_dir: Output directory.
+    target: Prediction target.
+    model: Regression model.
+    blocks: Feature blocks to include.
+    notes: Additional information.
+
+Returns:
+    Trained model bundle.
+"""
+```
+
+### `rank(bundle, rows)`
+```python
+"""
+Rank calls by their estimated WER.
+
+Args:
+    bundle: Trained model bundle.
+    rows: Input records.
+
+Returns:
+    Ranked calls.
+"""
+```
+
+### `plot_ridge(table, n=12, path=None)`
+```python
+"""
+Plot Ridge regression coefficients.
+
+Args:
+    table: Ridge coefficients.
+    n: Number of features to display.
+    path: Output file path.
+
+Returns:
+    Matplotlib figure.
+"""
+```
+
+### `plot_pdp(curve, feature, path=None)`
+```python
+"""
+Plot a partial dependence curve.
+
+Args:
+    curve: Partial dependence values.
+    feature: Feature name.
+    path: Output file path.
+
+Returns:
+    Matplotlib figure.
+"""
+```
+
+### `plot_importance_comparison(permutation_scores, xgb_gains, n=10, path=None)`
+```python
+"""
+Compare permutation and XGBoost feature importance.
+
+Args:
+    permutation_scores: Permutation importance scores.
+    xgb_gains: XGBoost importance scores.
+    n: Number of features to display.
+    path: Output file path.
+
+Returns:
+    Matplotlib figure.
+"""
+```
+
+
+
+
+
+
 # text_normalization.py
 
 ```python
