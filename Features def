@@ -1,0 +1,28 @@
+## Feature definitions
+
+### Proxy features (agreement between the target hypothesis and a proxy)
+
+- `pwer_<proxy>` — word error rate between the target hypothesis and the proxy's hypothesis (proxy as pseudo-reference).
+- `pcer_<proxy>` — character error rate between the target hypothesis and the proxy's hypothesis.
+- `psub_<proxy>` — substitution rate against the proxy (substitutions divided by the proxy's word count).
+- `pdel_<proxy>` — deletion rate against the proxy: share of the proxy's words missing from the target.
+- `pins_<proxy>` — insertion rate against the proxy: share of extra words the target added relative to the proxy.
+- `plen_ratio_<proxy>` — ratio of the target hypothesis length to the proxy hypothesis length.
+- `pwer_mean` — average pWER across all available proxies.
+- `pwer_min` — lowest pWER among all available proxies.
+- `pwer_max` — highest pWER among all available proxies.
+- `pwer_spread` — difference between the highest and lowest pWER across proxies.
+- `pwer_proxy_vs_proxy` — word error rate between the two proxies' hypotheses, independent of the target.
+
+### Text features (surface statistics of the target hypothesis alone)
+
+- `n_hyp_words` — number of words in the target hypothesis.
+- `n_hyp_chars` — number of characters in the target hypothesis.
+- `chars_per_word` — average word length in the target hypothesis.
+- `duration` — duration of the audio segment, in seconds.
+- `log_duration` — natural logarithm of one plus the segment duration.
+- `words_per_second` — speaking rate of the target hypothesis (words divided by segment duration).
+- `gzip_ratio` — gzip-compressed size of the hypothesis divided by its raw size; low values flag repetitive or degenerate text.
+- `type_token_ratio` — number of distinct words divided by the total number of words.
+- `repeated_word_ratio` — share of words in the hypothesis that are duplicates of another word in it.
+- `max_word_repeat` — number of occurrences of the most frequent word in the hypothesis.
