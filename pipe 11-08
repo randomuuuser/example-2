@@ -432,3 +432,37 @@ def report_metrics(rows, target="wer", model="hgb", blocks=("proxy", "text"),
         print(f"  {key:22s} {value}")
 
     return reports
+
+
+
+
+### --------- USAGE
+import pipeline as pl
+rows = pl.load_table(local_dir_results)
+
+pl.report_metrics(rows)                      # tout : régression + binaire + sélection + strat
+pl.report_metrics(rows, threshold=0.3)       # autre seuil bon/mauvais
+pl.report_metrics(rows, ks=(20, 50, 100))    # autres tailles de lot d'annotation
+
+
+
+## OR --------------------
+
+from evaluate import (cross_validate, call_metrics, regression_metrics,
+                      binary_metrics, precision_at_k, stratification_check)
+import numpy as np
+
+result = cross_validate(rows, target="wer")
+
+# niveau segment
+regression_metrics(result["y_wer"], result["pred_wer"])
+binary_metrics(result["y_wer"], result["pred_wer"], threshold=0.25)
+precision_at_k(result["y_wer"], result["pred_wer"], k=100)
+stratification_check(result["y_wer"], result["pred_wer"])
+
+# niveau appel
+calls, _ = call_metrics(result)
+y_true = np.array([c["wer_true"] for c in calls])
+y_pred = np.array([c["wer_pred"] for c in calls])
+regression_metrics(y_true, y_pred)
+
