@@ -498,3 +498,101 @@ def full_report(y_true, y_pred, threshold=BAD_THRESHOLD):
         "binary": binary,
         "confusion_matrix": matrix,
     }
+
+
+
+
+
+
+
+def split_wer(rows, indices, weighting="duration"):
+    """
+    True WER of a set of segments, under one of the two defensible schemes.
+
+    'duration': sum(wer_i * duration_i) / sum(duration_i). The scheme used
+        everywhere else in this pipeline, because duration is the only weight
+        available without references.
+    'word': sum(errors_i) / sum(n_ref_words_i). The canonical corpus WER - the
+        number you would report on a test set. Needs references, so it is an
+        evaluation-time quantity only.
+
+    Never use a plain mean of per-segment WERs: short segments carry unbounded
+    WER values and would dominate.
+    """
+    subset = [rows[i] for i in indices]
+    if not subset:
+        return None
+
+    if weighting == "word":
+        total_ref = sum(r["n_ref_words"] for r in subset)
+        return (float(sum(r["label_errors"] for r in subset) / total_ref)
+                if total_ref else None)
+
+    total_duration = sum(r["duration"] for r in subset)
+    return (float(sum(r["label_wer"] * r["duration"] for r in subset)
+                  / total_duration) if total_duration else None)
+
+
+
+
+def stratification_check(rows, y_pred, n_bins=4, n_splits=3, seed=0,
+                         weighting="duration", also_word_weighted=True):
+    """
+    Does stratifying on the PREDICTED WER produce splits homogeneous in TRUE WER?
+
+    Bins the segments on the prediction, deals each bin round-robin into
+    n_splits, then reports the true WER of each split. The spread across splits
+    is the error you would actually inherit from using the estimator to build
+    train/dev/test.
+
+    'spread_stratified' is only meaningful against 'spread_random', the same
+    spread under a purely random assignment: stratification is worth doing only
+    if the first is clearly smaller.
+
+    weighting selects the aggregation for the reported WER (see split_wer).
+    also_word_weighted repeats the measurement under the canonical word-weighted
+    scheme, so you can check the conclusion does not depend on that choice.
+    """
+    y_pred = np.asarray(y_pred, dtype=float)
+    rng = np.random.default_rng(seed)
+
+    edges = np.quantile(y_pred, np.linspace(0, 1, n_bins + 1)[1:-1])
+    bins = np.digitize(y_pred, edges)
+
+    assignment = np.zeros(len(rows), dtype=int)
+    for bin_index in range(n_bins):
+        members = np.where(bins == bin_index)[0]
+        rng.shuffle(members)
+        assignment[members] = np.arange(len(members)) % n_splits
+
+    random_assignment = rng.integers(0, n_splits, size=len(rows))
+
+    def spreads(scheme):
+        stratified = [split_wer(rows, np.where(assignment == s)[0], scheme)
+                      for s in range(n_splits)]
+        random_means = [split_wer(rows, np.where(random_assignment == s)[0], scheme)
+                        for s in range(n_splits)]
+        return stratified, random_means
+
+    stratified, random_means = spreads(weighting)
+    report = {
+        "n_bins": n_bins,
+        "n_splits": n_splits,
+        "weighting": weighting,
+        "true_wer_per_split": [round(v, 4) for v in stratified],
+        "spread_stratified": round(max(stratified) - min(stratified), 4),
+        "spread_random": round(max(random_means) - min(random_means), 4),
+        "true_wer_overall": round(
+            split_wer(rows, range(len(rows)), weighting), 4),
+    }
+
+    if also_word_weighted and weighting != "word":
+        word_strat, word_random = spreads("word")
+        report.update({
+            "word_wer_per_split": [round(v, 4) for v in word_strat],
+            "word_spread_stratified": round(max(word_strat) - min(word_strat), 4),
+            "word_spread_random": round(max(word_random) - min(word_random), 4),
+            "word_wer_overall": round(split_wer(rows, range(len(rows)), "word"), 4),
+        })
+
+    return report
