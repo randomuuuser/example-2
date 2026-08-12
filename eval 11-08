@@ -596,3 +596,52 @@ def stratification_check(rows, y_pred, n_bins=4, n_splits=3, seed=0,
         })
 
     return report
+
+
+
+
+
+def r2_decomposition(y_true, y_pred):
+    """
+    Distribution statistics behind R2, so the score can be read instead of guessed.
+
+    R2 is 1 - MSE / Var(y_true), so the spread of the TRUE values is literally
+    its denominator: the same estimator scores high on a heterogeneous sample
+    and low on a homogeneous one. Reporting std_true makes that visible.
+
+    std_ratio = std_pred / std_true measures SHRINKAGE. Tree models cannot
+    extrapolate beyond the range seen in training and regress toward the local
+    mean when the target is noisy, so a ratio well below 1 means the model
+    refuses to commit to extreme values - the main way R2 is lost.
+
+    The exact identity, with r = pearson and k = std_ratio:
+
+        R2 = 2*r*k - k**2 - (bias / std_true)**2
+
+    It is maximised at k = r, where R2 = r**2. So pearson**2 is the ceiling R2
+    could reach if the spread were perfectly calibrated, and the two loss terms
+    say how much is given up to shrinkage and to bias respectively.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    std_true = float(y_true.std())
+    std_pred = float(y_pred.std())
+    bias = float(np.mean(y_pred - y_true))
+    r = float(stats.pearsonr(y_true, y_pred)[0])
+    k = std_pred / std_true if std_true > 0 else None
+
+    report = {
+        "mean_true": float(y_true.mean()),
+        "mean_pred": float(y_pred.mean()),
+        "std_true": std_true,
+        "std_pred": std_pred,
+        "std_ratio": k,
+        "bias": bias,
+        "R2": float(r2_score(y_true, y_pred)),
+        "R2_ceiling": r ** 2,
+    }
+    if k is not None:
+        report["loss_from_bias"] = (bias / std_true) ** 2
+        report["loss_from_shrinkage"] = (r - k) ** 2
+    return report
