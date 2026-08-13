@@ -1,0 +1,185 @@
+"""
+Whisper-large-v3 runner, drop-in replacement for run_canary in the WER pipeline.
+
+Same contract: run_whisper(records, cache_path, model_name=<local dir>) ->
+{segment_id: row}, with the same crash-resilient chunk/append_cache behaviour.
+
+Weights are always read from a local folder, never downloaded.
+"""
+
+import os
+from collections import defaultdict
+
+import torch
+import librosa
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+WHISPER_DIR = "/mon_repertoire/xxx/whisper-large-v3"
+SAMPLING_RATE = 16_000
+
+# role -> (local path or .nemo checkpoint, kind)
+SYSTEMS = {
+    "target": ("/mon_repertoire/xxx/canary-180m-flash.nemo", "canary"),
+    "proxy_a": ("/mon_repertoire/xxx/canary-180m-flash-ft.nemo", "canary"),
+    "proxy_b": ("/mon_repertoire/xxx/parakeet-tdt-0.6b-v3.nemo", "canary"),
+    "proxy_c": (WHISPER_DIR, "whisper"),
+}
+
+
+def system_label(model_name):
+    """Short, stable name for the `system` column, from a path or a model id."""
+    base = os.path.basename(model_name.rstrip("/"))
+    return os.path.splitext(base)[0]
+
+
+def whisper_lang(lang):
+    """Map a record language to a Whisper language token; None = auto-detect."""
+    if not lang:
+        return None
+    return lang.split("-")[0].split("_")[0].lower()  # "es-PE" -> "es"
+
+
+def load_whisper(base_model_path=WHISPER_DIR, device=None):
+    """
+    Load whisper-large-v3 from a local folder and force greedy decoding.
+    Greedy keeps the error profile comparable to the Canary/Parakeet systems:
+    beam search would change the very thing we are trying to predict.
+    """
+    if device is None:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device.startswith("cuda") else torch.float32
+
+    processor = WhisperProcessor.from_pretrained(base_model_path, local_files_only=True)
+    model = WhisperForConditionalGeneration.from_pretrained(
+        base_model_path,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+        attn_implementation="sdpa",
+        local_files_only=True,
+    )
+    model.to(device)
+    model.eval()
+
+    # Legacy checkpoints ship forced_decoder_ids, which conflicts with language=/task=
+    model.generation_config.forced_decoder_ids = None
+    return processor, model
+
+
+def read_audio(wav_path):
+    """Mono 16 kHz float32, whatever the source format and sample rate."""
+    audio, _ = librosa.load(wav_path, sr=SAMPLING_RATE, mono=True)
+    return audio
+
+
+def transcribe_short(processor, model, audios, lang):
+    """Batched decoding for segments under 30 s (the feature extractor pads them)."""
+    inputs = processor(audios, sampling_rate=SAMPLING_RATE, return_tensors="pt")
+    inputs = inputs.to(model.device, model.dtype)
+    with torch.inference_mode():
+        tokens = model.generate(
+            **inputs,
+            language=lang,
+            task="transcribe",
+            num_beams=1,
+            return_timestamps=False,
+        )
+    return [t.strip() for t in processor.batch_decode(tokens, skip_special_tokens=True)]
+
+
+def transcribe_long(processor, model, audio, lang):
+    """Sequential long-form decoding for segments over 30 s, one at a time."""
+    inputs = processor(
+        audio,
+        sampling_rate=SAMPLING_RATE,
+        return_tensors="pt",
+        truncation=False,
+        padding="longest",
+        return_attention_mask=True,
+    )
+    inputs = inputs.to(model.device, model.dtype)
+    with torch.inference_mode():
+        tokens = model.generate(
+            **inputs,
+            language=lang,
+            task="transcribe",
+            num_beams=1,
+            return_timestamps=True,  # mandatory for long-form
+            condition_on_prev_tokens=False,  # no context leak across windows
+            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            logprob_threshold=-1.0,
+            compression_ratio_threshold=1.35,
+            no_speech_threshold=0.6,
+        )
+    return processor.batch_decode(tokens, skip_special_tokens=True)[0].strip()
+
+
+def run_whisper(records, cache_path, model_name=WHISPER_DIR, batch_size=8, chunk=256):
+    """
+    Transcribe every pending record with a local Whisper checkpoint.
+    Appends to the cache once per chunk so progress survives a crash.
+    Batches are grouped by language: unlike the Canary manifest, one generate()
+    call carries a single language token for the whole batch.
+    """
+    cache = load_cache(cache_path)
+    todo = pending(records, cache)
+    if not todo:
+        return cache
+
+    system = system_label(model_name)
+    processor, model = load_whisper(model_name)
+    try:
+        for start in range(0, len(todo), chunk):
+            block = todo[start:start + chunk]
+            rows = []
+
+            by_lang = defaultdict(list)
+            for record in block:
+                by_lang[whisper_lang(record["lang"])].append(record)
+
+            for lang, group in by_lang.items():
+                short = [r for r in group if r["duration"] <= 30.0]
+                long = [r for r in group if r["duration"] > 30.0]
+
+                for i in range(0, len(short), batch_size):
+                    sub = short[i:i + batch_size]
+                    audios = [read_audio(r["wav_path"]) for r in sub]
+                    texts = transcribe_short(processor, model, audios, lang)
+                    rows += [
+                        {"segment_id": r["segment_id"], "system": system, "text": t}
+                        for r, t in zip(sub, texts)
+                    ]
+
+                for record in long:
+                    text = transcribe_long(
+                        processor, model, read_audio(record["wav_path"]), lang
+                    )
+                    rows.append(
+                        {"segment_id": record["segment_id"], "system": system, "text": text}
+                    )
+
+            append_cache(cache_path, rows)
+            for row in rows:
+                cache[row["segment_id"]] = row
+            print(f"  {system}: {min(start + chunk, len(todo))}/{len(todo)}")
+    finally:
+        del processor
+        release_model(model)
+    return cache
+
+
+def run_all(records, out_dir, systems=None):
+    """
+    Run every system in turn and return {role: {segment_id: text}}.
+    Models are loaded sequentially, so peak GPU memory is that of the largest
+    single system rather than their sum.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    systems = systems or SYSTEMS
+    results = {}
+    for role, (model_name, kind) in systems.items():
+        cache_path = os.path.join(out_dir, f"{role}.jsonl")
+        print(f"\n=== {role}: {model_name} ===")
+        runner = run_canary if kind == "canary" else run_whisper
+        cache = runner(records, cache_path, model_name=model_name)
+        results[role] = {sid: row["text"] for sid, row in cache.items()}
+    return results
