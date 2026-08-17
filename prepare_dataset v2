@@ -1,0 +1,444 @@
+"""
+Block 2a - Dataset preparation.
+
+Turns the long-form call recordings + test-set JSON into one 16 kHz mono wav
+per annotated segment, plus a manifest that every ASR system will consume.
+
+Design decision: the HUMAN LABEL segmentation is canonical.
+The JSON carries two segmentations - 'prediction' (produced by whatever ASR
+made it) and 'label' (human). They do not share boundaries, so aligning them
+by time overlap would inject an arbitrary matching step into the pipeline.
+Instead we cut the audio on the label boundaries and re-transcribe those exact
+spans with every system. Same audio in, comparable text out, and the WER is
+defined without any alignment heuristic.
+
+Expected JSON shape:
+    {"VERSION": ..., "samples": {
+        "<sample_id>": {
+            "sample_id": str,
+            "path_audio": str,
+            "channel_operator": <index or name>,
+            "channel_client":   <index or name>,
+            "prediction": {"segments": [...]},
+            "label":      {"segments": [
+                {"start_time": float, "end_time": float, "channel": ...,
+                 "annotation": {"speaker_id":..., "speaker_role":...,
+                                "text": str, "words": [...]}}
+            ]}
+        }, ...
+    }}
+"""
+
+import json
+import os
+import subprocess
+import wave
+
+import numpy as np
+
+from text_norm import normalize_text
+
+TARGET_SR = 16000
+
+# Normalization settings, frozen once per corpus and persisted next to the
+# data. Every later step reloads them, which is what guarantees that the
+# reference and all three hypotheses went through the exact same function.
+DEFAULT_NORM = {"strip_accents": False, "expand_numbers": True}
+NORM_CONFIG_NAME = "norm_config.json"
+
+
+def write_norm_config(out_dir, norm_config):
+    """Persist the normalization settings inside the corpus directory."""
+    path = os.path.join(out_dir, NORM_CONFIG_NAME)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(norm_config, handle, indent=1)
+    return path
+
+
+def read_norm_config(out_dir):
+    """Reload the settings that were used to prepare this corpus."""
+    path = os.path.join(out_dir, NORM_CONFIG_NAME)
+    if not os.path.exists(path):
+        return dict(DEFAULT_NORM)
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+# --------------------------------------------------------------------------
+# Audio I/O
+# --------------------------------------------------------------------------
+
+def probe_channels(path):
+    """Number of audio channels, via ffprobe."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=channels", "-of", "csv=p=0", path],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    return int(out.splitlines()[0])
+
+
+def load_call(path, sr=TARGET_SR):
+    """
+    Decode a full call to float32, shape [n_samples, n_channels].
+
+    Decoding the whole mp3 once and slicing in memory is far cheaper than one
+    ffmpeg seek per segment, and mp3 seeking is imprecise anyway.
+    """
+    n_channels = probe_channels(path)
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path,
+         "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(sr), "-"],
+        capture_output=True, check=True,
+    ).stdout
+    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    return audio.reshape(-1, n_channels)
+
+
+def write_wav_mono(path, samples, sr=TARGET_SR):
+    """Write a mono 16-bit PCM wav (what NeMo and Whisper both expect)."""
+    clipped = np.clip(samples, -1.0, 1.0)
+    pcm = (clipped * 32767.0).astype("<i2")
+    with wave.open(path, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sr)
+        handle.writeframes(pcm.tobytes())
+
+
+# --------------------------------------------------------------------------
+# Channel resolution
+# --------------------------------------------------------------------------
+
+def _as_int(value):
+    """Numeric channel identifier as an int, or None if it is symbolic."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("+-").isdigit():
+        return int(value.strip())
+    return None
+
+
+def channel_offset(sample):
+    """
+    Whether this sample numbers its channels from 0 or from 1.
+
+    Decided from the DECLARED pair, not from the individual value: the id 1
+    means the second channel under 0-based numbering and the first under
+    1-based, so a single value cannot disambiguate. {0, 1} gives offset 0,
+    {1, 2} gives offset 1.
+    """
+    declared = [_as_int(sample.get(key))
+                for key in ("channel_operator", "channel_client")]
+    declared = [d for d in declared if d is not None]
+    return min(declared) if declared else 0
+
+
+def resolve_channel(segment, sample, n_channels, assume_order=True):
+    """
+    Map a segment's 'channel' field to a column index in the decoded array.
+
+    The segment's 'channel' value IS the physical channel identifier; the
+    sample-level 'channel_operator' / 'channel_client' only say which role sits
+    on which one. A numeric identifier is therefore converted directly, after
+    subtracting the sample's numbering offset - never assumed to be 0 for the
+    operator.
+
+    Purely symbolic identifiers ('operator', 'left') carry no physical
+    information. With assume_order=True they fall back to the declaration order
+    (channel_operator first), which is a GUESS - verify it with
+    diagnose_channels before trusting it. With assume_order=False they return
+    None and the caller mixes down.
+    """
+    if n_channels == 1:
+        return None
+
+    raw = segment.get("channel")
+    numeric = _as_int(raw)
+    if numeric is not None:
+        index = numeric - channel_offset(sample)
+        return index if 0 <= index < n_channels else None
+
+    # symbolic identifier: try the declared value it matches
+    for position, key in enumerate(("channel_operator", "channel_client")):
+        if str(raw) == str(sample.get(key)):
+            declared = _as_int(sample.get(key))
+            if declared is not None:
+                index = declared - channel_offset(sample)
+                return index if 0 <= index < n_channels else None
+            return position if assume_order else None
+    return None
+
+
+def diagnose_channels(json_path, audio_root="", lang="de", n_samples=3,
+                      source="label"):
+    """
+    Measure the energy actually present on each channel, per speaker role.
+
+    Run this whenever exported segments come out silent. For each role it
+    reports the mean RMS of every channel over that role's segments: the
+    channel carrying the voice has clearly higher energy, and comparing it to
+    the index resolve_channel picked tells you immediately whether the mapping
+    is inverted or off by one.
+    """
+    records, _ = read_segments(json_path, lang, min_ref_words=1, source=source)
+    by_call = {}
+    for record in records:
+        by_call.setdefault(record["sample_id"], []).append(record)
+
+    report = []
+    for sample_id, call_records in list(by_call.items())[:n_samples]:
+        path = os.path.join(audio_root, call_records[0]["path_audio"])
+        audio = load_call(path)
+        n_channels = audio.shape[1]
+
+        roles = {}
+        for record in call_records:
+            roles.setdefault(record["speaker_role"], []).append(record)
+
+        for role, role_records in roles.items():
+            energies = np.zeros(n_channels)
+            for record in role_records[:40]:
+                start = int(record["start_time"] * TARGET_SR)
+                end = int(record["end_time"] * TARGET_SR)
+                chunk = audio[max(0, start):min(len(audio), end)]
+                if len(chunk):
+                    energies += np.sqrt((chunk ** 2).mean(axis=0))
+            energies /= max(len(role_records[:40]), 1)
+
+            picked = resolve_channel(
+                {"channel": role_records[0]["channel_raw"]},
+                {"channel_operator": role_records[0]["channel_operator"],
+                 "channel_client": role_records[0]["channel_client"]},
+                n_channels,
+            )
+            report.append({
+                "sample_id": sample_id[:12],
+                "role": role,
+                "channel_raw": role_records[0]["channel_raw"],
+                "rms_per_channel": [round(float(e), 5) for e in energies],
+                "loudest_channel": int(np.argmax(energies)),
+                "channel_picked": picked,
+                "ok": picked == int(np.argmax(energies)),
+            })
+    return report
+
+
+def extract_segment(call_audio, sr, start_time, end_time, channel_index,
+                    pad=0.0):
+    """
+    Slice one segment, keeping a single channel.
+
+    Isolating the speaker's own channel removes the other party's crosstalk,
+    which is the main reason stereo call recordings transcribe better than
+    their mixdown.
+    """
+    start = max(0, int((start_time - pad) * sr))
+    end = min(call_audio.shape[0], int((end_time + pad) * sr))
+    if end <= start:
+        return np.zeros(0, dtype=np.float32)
+
+    chunk = call_audio[start:end]
+    if channel_index is None:
+        return chunk.mean(axis=1)
+    return chunk[:, channel_index]
+
+
+# --------------------------------------------------------------------------
+# JSON parsing
+# --------------------------------------------------------------------------
+
+def read_segments(json_path, lang, min_ref_words=10, roles=None,
+                  source="label", norm_config=None):
+    """
+    Flatten the test-set JSON into one record per annotated segment.
+
+    Args:
+        json_path: path to the test-set JSON.
+        lang: corpus language code ('es', 'de'), applied to every record.
+        min_ref_words: drop shorter references. On a 3-word segment the WER
+            only takes a handful of discrete values, which is metric noise
+            rather than signal. Counted on the NORMALIZED reference, because
+            that is what will sit in the WER denominator: in Spanish
+            'son 1234 soles' is 3 raw words but 7 normalized ones.
+        norm_config: kwargs forwarded to normalize_text. Frozen here and
+            persisted, so every later step reuses the identical settings.
+        roles: keep only these speaker_role values (e.g. {'Client'}).
+        source: 'label' for the human segmentation, 'prediction' to inspect
+            the pre-existing ASR one.
+
+    Returns:
+        (records, stats) where stats counts what was dropped and why.
+    """
+    norm_config = dict(DEFAULT_NORM if norm_config is None else norm_config)
+
+    with open(json_path, encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    records = []
+    stats = {"samples": 0, "segments": 0, "empty_text": 0,
+             "too_short": 0, "bad_span": 0, "wrong_role": 0, "kept": 0}
+
+    for sample_id, sample in data.get("samples", {}).items():
+        stats["samples"] += 1
+        segments = sample.get(source, {}).get("segments", []) or []
+
+        for index, segment in enumerate(segments):
+            stats["segments"] += 1
+            annotation = segment.get("annotation") or {}
+            text = (annotation.get("text") or "").strip()
+            role = annotation.get("speaker_role")
+
+            if roles is not None and role not in roles:
+                stats["wrong_role"] += 1
+                continue
+            if not text:
+                stats["empty_text"] += 1
+                continue
+
+            start_time = float(segment.get("start_time", 0.0))
+            end_time = float(segment.get("end_time", 0.0))
+            if end_time <= start_time:
+                stats["bad_span"] += 1
+                continue
+            reference_norm = normalize_text(text, lang, **norm_config)
+            n_ref_words = len(reference_norm.split())
+            if n_ref_words < min_ref_words:
+                stats["too_short"] += 1
+                continue
+
+            records.append({
+                "segment_id": f"{sample_id}__{index:04d}",
+                "sample_id": sample_id,
+                "path_audio": sample.get("path_audio"),
+                "channel_raw": segment.get("channel"),
+                "channel_operator": sample.get("channel_operator"),
+                "channel_client": sample.get("channel_client"),
+                "speaker_role": role,
+                "speaker_id": annotation.get("speaker_id"),
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration": round(end_time - start_time, 3),
+                "reference": text,
+                "reference_norm": reference_norm,
+                "n_ref_words": n_ref_words,
+                "lang": lang,
+            })
+            stats["kept"] += 1
+
+    return records, stats
+
+
+# --------------------------------------------------------------------------
+# Export
+# --------------------------------------------------------------------------
+
+def export_segments(records, out_dir, audio_root=""):
+    """
+    Cut and write one 16 kHz mono wav per record.
+
+    Each call is decoded exactly once. Records already holding a readable
+    'wav_path' are skipped, so the step is resumable.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    by_call = {}
+    for record in records:
+        by_call.setdefault(record["sample_id"], []).append(record)
+
+    failures = []
+    for sample_id, call_records in by_call.items():
+        source_path = os.path.join(audio_root, call_records[0]["path_audio"])
+        try:
+            call_audio = load_call(source_path)
+        except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as error:
+            failures.append((sample_id, repr(error)))
+            continue
+
+        n_channels = call_audio.shape[1]
+        for record in call_records:
+            wav_path = os.path.join(out_dir, record["segment_id"] + ".wav")
+            if os.path.exists(wav_path):
+                record["wav_path"] = wav_path
+                continue
+
+            channel_index = resolve_channel(
+                {"channel": record["channel_raw"]},
+                {"channel_operator": record["channel_operator"],
+                 "channel_client": record["channel_client"]},
+                n_channels,
+            )
+            samples = extract_segment(
+                call_audio, TARGET_SR,
+                record["start_time"], record["end_time"], channel_index,
+            )
+            if samples.size == 0:
+                failures.append((record["segment_id"], "empty slice"))
+                continue
+
+            write_wav_mono(wav_path, samples)
+            record["wav_path"] = wav_path
+            record["channel_index"] = channel_index
+
+    return [r for r in records if "wav_path" in r], failures
+
+
+def write_nemo_manifest(records, manifest_path, task="asr", pnc="yes"):
+    """
+    Write the JSONL manifest Canary consumes.
+
+    source_lang / target_lang must both be set for an ASR (non-translation)
+    task; leaving them out is the usual reason Canary silently falls back to
+    English.
+    """
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps({
+                "audio_filepath": os.path.abspath(record["wav_path"]),
+                "duration": record["duration"],
+                "taskname": task,
+                "task": task,
+                "source_lang": record["lang"],
+                "target_lang": record["lang"],
+                "pnc": pnc,
+                "segment_id": record["segment_id"],
+            }, ensure_ascii=False) + "\n")
+    return manifest_path
+
+
+def write_records(records, path):
+    """Persist the flattened records as JSONL for the next blocks."""
+    with open(path, "w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return path
+
+
+def read_records(path):
+    """Load records written by write_records."""
+    with open(path, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def prepare_corpus(json_path, lang, out_dir, audio_root="",
+                   min_ref_words=10, roles=None, norm_config=None):
+    """Run the whole block: parse, normalize, cut, export, write manifest."""
+    os.makedirs(out_dir, exist_ok=True)
+    norm_config = dict(DEFAULT_NORM if norm_config is None else norm_config)
+    write_norm_config(out_dir, norm_config)
+
+    records, stats = read_segments(
+        json_path, lang, min_ref_words=min_ref_words, roles=roles,
+        norm_config=norm_config,
+    )
+    records, failures = export_segments(records, os.path.join(out_dir, "wav"),
+                                        audio_root)
+    write_records(records, os.path.join(out_dir, "segments.jsonl"))
+    write_nemo_manifest(records, os.path.join(out_dir, "manifest.json"))
+
+    stats["exported"] = len(records)
+    stats["failures"] = len(failures)
+    total_hours = sum(r["duration"] for r in records) / 3600.0
+    stats["hours"] = round(total_hours, 3)
+    return records, stats, failures
