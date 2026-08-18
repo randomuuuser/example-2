@@ -59,3 +59,29 @@ def plot_wer_distributions(result, calls, clip=1.5, bins=40, path=None):
     if path:
         fig.savefig(path, dpi=200, bbox_inches="tight")
     return fig
+
+
+// add pipeline
+def plot_distributions(rows, target="wer", model="hgb",
+                       blocks=("proxy", "text"), n_splits=5, clip=1.5,
+                       path=None):
+    """
+    True vs estimated WER distributions, at segment and call level.
+ 
+    The gap between the two standard deviations in the legend is the shrinkage:
+    a narrower estimated distribution means the model stays near the mean
+    instead of committing to extreme values.
+    """
+    from evaluate import call_metrics, cross_validate
+    from plots_dist import plot_wer_distributions
+ 
+    result = cross_validate(rows, blocks=blocks, target=target, model=model,
+                            n_splits=n_splits)
+    calls, _ = call_metrics(result)
+    return plot_wer_distributions(result, calls, clip=clip, path=path)
+
+
+//usage 
+pl.plot_distributions(rows, path="wer_distributions.png")
+pl.plot_distributions(rows, clip=3.0)   # si tu veux voir plus loin dans la queue
+                           
