@@ -1,0 +1,148 @@
+## Biais
+
+`biais = moyenne(prédit − vrai)`
+
+C'est la moyenne des erreurs **signées**, là où la MAE moyenne les erreurs en valeur absolue. Un biais positif signifie que tu surestimes systématiquement, un biais négatif que tu sous-estimes.
+
+Comment le lire, en comparant toujours au MAE :
+
+- **|biais| proche du MAE** → l'erreur est presque entièrement systématique. Tu te trompes toujours dans le même sens, de la même quantité. C'est la meilleure nouvelle possible : il suffit de retrancher cette constante pour corriger.
+- **biais proche de 0 alors que le MAE est grand** → l'erreur est aléatoire. Tu te trompes autant vers le haut que vers le bas. Non corrigeable.
+
+Exemple concret. Deux estimateurs ayant tous deux un MAE de 0,04 : le premier prédit toujours 4 points de trop (biais = +0,04), le second alterne entre +0,04 et −0,04 (biais = 0). Le premier est utilisable après correction, le second non. La MAE seule ne les distingue pas.
+
+Propriété mathématique utile : **|biais| ≤ MAE toujours**. Le rapport `|biais| / MAE` donne directement la part systématique de ton erreur.
+
+Point de vigilance : Fe-WER rapporte une sous-estimation systématique (10,39 % estimé contre 10,88 % réel) sans jamais la nommer. Si tu trouves le même profil, c'est une information de premier ordre — et une correction gratuite à appliquer en production.
+
+---
+
+## R²
+
+`R² = 1 − SS_résiduelle / SS_totale`
+
+avec `SS_résiduelle = Σ(vrai − prédit)²` et `SS_totale = Σ(vrai − moyenne_des_vrais)²`.
+
+La lecture directe : **R² compare ton estimateur au fait de toujours prédire la moyenne.** C'est exactement ta baseline `dummy`.
+
+- **R² = 1** → prédiction parfaite.
+- **R² = 0** → tu fais aussi bien que prédire la moyenne du corpus. Ton modèle n'apporte rien.
+- **R² < 0** → tu fais **pire** que la moyenne. C'est possible, contrairement à ce que la notation « au carré » suggère.
+- **R² = 0,80** → tu as éliminé 80 % de l'erreur quadratique qu'aurait faite la moyenne.
+
+**La différence avec Pearson, qui est le point important.** Pearson mesure la corrélation ; R² mesure la corrélation **et** la calibration. Un estimateur qui prédirait systématiquement le double du vrai WER aurait Pearson = 1,0 (ordre parfait, relation parfaitement linéaire) mais un R² catastrophique. L'écart entre `pearson²` et `R²` mesure donc exactement ton défaut de calibration.
+
+**La réserve pour ton cas.** `SS_totale` est la variance de tes 23 appels. Donc R² dépend autant de l'hétérogénéité de ton corpus que de ton estimateur : à erreur absolue identique, un corpus étalé donne un bon R² et un corpus homogène un mauvais R². C'est pourquoi je te déconseillais d'en faire un chiffre-titre au niveau appel.
+
+---
+
+## Kendall tau
+
+`τ = (paires concordantes − paires discordantes) / nombre total de paires`
+
+On prend toutes les paires d'appels possibles. Une paire est **concordante** si le vrai et le prédit les classent dans le même ordre : si l'appel A a un WER réel supérieur à B, et que ton estimateur prédit aussi A au-dessus de B. Elle est **discordante** sinon.
+
+Sur tes 23 appels, cela fait 23 × 22 / 2 = **253 paires**.
+
+Lecture immédiate et probabiliste : `τ = P(concordante) − P(discordante)`. Un τ de 0,60 signifie que si tu tires deux appels au hasard, tu as 80 % de chances de les ordonner correctement et 20 % de te tromper.
+
+**Différence avec Spearman.** Spearman est un Pearson calculé sur les rangs, donc il pénalise l'ampleur du désordre — inverser le 1er et le 20e coûte beaucoup plus qu'inverser le 10e et le 11e. Kendall compte simplement les inversions, sans les pondérer.
+
+Deux conséquences pratiques :
+
+1. **Kendall est systématiquement plus petit que Spearman** sur les mêmes données — typiquement autour de 0,7 à 0,8 fois. Un τ de 0,70 face à un ρ de 0,90 n'est pas une contradiction. **Ne compare jamais les deux valeurs directement.**
+2. **Kendall est plus robuste à petit échantillon.** C'est pour ça que je l'ai ajouté : avec 23 appels, son intervalle de confiance est plus stable que celui de Spearman.
+
+---
+
+## Prevalence
+
+`prévalence = nombre de cas réellement mauvais / nombre total`
+
+C'est le taux de base, la proportion de « mauvais » dans ta population. À 0,25 de seuil, si 457 segments sur 1 344 ont un WER réel supérieur à 0,25, la prévalence vaut 0,34.
+
+**Ce n'est pas une métrique de performance, c'est le point de comparaison sans lequel deux autres métriques sont ininterprétables :**
+
+- **PR-AUC** : un classement purement aléatoire atteint un PR-AUC égal à la prévalence. Donc un PR-AUC de 0,45 est excellent si la prévalence vaut 0,05, et nul si elle vaut 0,45. **Ne compare jamais un PR-AUC à 0,5** — c'est le repère du ROC-AUC, pas du PR-AUC.
+- **precision@k** : sélectionner k éléments au hasard donne une précision égale à la prévalence. C'est ce dont on déduit le lift.
+
+C'est aussi l'indicateur qui te dit si une métrique binaire est exploitable. Sur 23 appels avec une prévalence de 0,05, tu n'as qu'un seul appel positif : aucune métrique de classification n'a de sens.
+
+---
+
+## Lift
+
+`lift = precision@k / prévalence`
+
+Combien de fois ta sélection est meilleure qu'un tirage au hasard.
+
+- **lift = 1** → ton estimateur ne vaut pas mieux que piocher au hasard. Pour l'active learning, il est inutile.
+- **lift = 2** → tu récupères deux fois plus de mauvaises transcriptions à effort d'annotation égal.
+- **lift = 3** → l'annotateur travaille trois fois plus efficacement.
+
+**Le piège à connaître : le lift est plafonné à `1 / prévalence`.** Quand ta precision@k atteint 1,0 (que du mauvais dans la sélection), tu ne peux pas faire mieux. Avec une prévalence de 0,37, le lift maximal est donc 2,72 — et pas davantage, quelle que soit la qualité de ton modèle.
+
+Conséquence pour ta lecture : un lift de 2,72 avec une prévalence de 0,37 est un score **parfait**, pas un score moyen. Rapporte toujours le lift à son plafond, sinon il paraît médiocre alors qu'il est maximal. À l'inverse, sur une population où le mauvais est rare (prévalence 0,05), des lifts de 10 ou 15 sont atteignables.
+
+---
+
+## MCC (Matthews Correlation Coefficient)
+
+$$\text{MCC} = \frac{TP \cdot TN - FP \cdot FN}{\sqrt{(TP+FP)(TP+FN)(TN+FP)(TN+FN)}}$$
+
+La façon la plus simple de le comprendre : **c'est la corrélation de Pearson entre le vecteur des vraies étiquettes binaires et celui des étiquettes prédites.** D'où sa plage de −1 à +1.
+
+- **+1** → classification parfaite
+- **0** → aucun lien avec la vérité, équivalent au hasard
+- **−1** → prédiction systématiquement inversée
+
+**Pourquoi il vaut mieux que l'accuracy**, et c'est là tout son intérêt. Imagine une population où 90 % des transcriptions sont bonnes. Un classifieur trivial qui répondrait « bonne » à tout obtient **90 % d'accuracy** — un chiffre flatteur pour un modèle qui n'a rien appris. Son MCC, lui, vaut 0, parce qu'il n'y a aucune corrélation entre ses réponses et la vérité.
+
+Le MCC est le seul des indicateurs binaires courants à exiger que les **quatre** cases de la matrice de confusion soient bonnes simultanément. F1, lui, ignore complètement les vrais négatifs.
+
+Repères d'usage : au-dessus de 0,7 c'est fort, entre 0,4 et 0,7 c'est correct, en dessous de 0,2 c'est faible. Ce sont des conventions, pas des seuils statistiques.
+
+---
+
+## mean_true_wer_at_k
+
+`mean_true_wer_at_k = moyenne des WER réels des k segments les mieux classés`
+
+C'est le complément indispensable de `precision@k`, parce que les deux répondent à des questions différentes : `precision@k` dit **combien** de tes sélections sont mauvaises, `mean_true_wer_at_k` dit **à quel point** elles le sont.
+
+Deux sélections peuvent avoir une precision@k identique de 1,0 — toutes deux ne contiennent que des transcriptions mauvaises — mais l'une avec un WER moyen de 0,90 et l'autre de 0,30. La première envoie à l'annotateur des transcriptions catastrophiques, la seconde des transcriptions médiocres. Ce n'est pas le même usage de son temps.
+
+Comment l'utiliser : trace `mean_true_wer_at_k` en fonction de k. La courbe doit **décroître** quand k augmente — c'est la preuve que ton classement fonctionne, les pires étant bien en tête. Le point où elle s'aplatit t'indique la taille de lot au-delà de laquelle tu commences à annoter du tout-venant.
+
+Sur mes données de test, la courbe passe de 0,90 à k=50, à 0,88 à k=100, puis 0,71 à k=200 — décroissance nette, donc classement sain.
+
+---
+
+## stratification_check
+
+Cette fonction répond à une question précise : **si je constitue mes splits train/dev/test en me basant sur le WER prédit, obtiendrai-je des splits réellement homogènes en WER réel ?**
+
+Le déroulement, en quatre étapes :
+
+1. **Découpage en strates.** On calcule les quantiles du WER **prédit** et on répartit les segments en `n_bins` groupes de taille égale (4 par défaut) : les 25 % de WER prédit le plus faible, puis les suivants, etc.
+
+2. **Distribution en tourniquet.** À l'intérieur de chaque strate, on mélange puis on distribue les segments à tour de rôle entre les `n_splits` ensembles (3 par défaut). Chaque split reçoit ainsi une part égale de chaque strate — c'est le principe même de la stratification.
+
+3. **Mesure sur la vérité.** Pour chaque split, on calcule la moyenne du WER **réel**. C'est le test : les splits ont été construits sur le prédit, on les évalue sur le vrai.
+
+4. **Comparaison à un témoin aléatoire.** On refait la même mesure avec une affectation purement aléatoire.
+
+Ce que renvoie la fonction :
+
+```
+true_wer_per_split   [0.2475, 0.2373, 0.2474]
+spread_stratified    0.0103     ← écart max-min entre splits stratifiés
+spread_random        0.0228     ← le même écart, en affectation aléatoire
+true_wer_overall     0.2441
+```
+
+**La lecture tient dans le rapport des deux `spread`.** Ici 0,0103 contre 0,0228 : la stratification par WER prédit divise par deux l'hétérogénéité entre splits. Si les deux valeurs étaient proches, ça signifierait que ton estimateur n'apporte rien à cette tâche et qu'autant tirer au hasard.
+
+Et `spread_stratified` a une interprétation directement opérationnelle : c'est **l'écart de WER que tu hériterais réellement** entre ton train et ton test. Un écart de 0,01 sur des WER autour de 0,24 est négligeable ; un écart de 0,08 signifierait que ton test est structurellement plus dur que ton train, ce qui fausserait toute évaluation menée dessus.
+
+Pourquoi ce test plutôt qu'une métrique classique : aucune métrique intermédiaire ne répond à cette question. Un bon Spearman garantit le bon ordre, mais si tes frontières de quantiles tombent au mauvais endroit, tes strates sont fausses malgré un ordre correct. Ce test mesure directement la conséquence, sans passer par un proxy.
