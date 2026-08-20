@@ -45,7 +45,7 @@ def _reject_reason(char, allowed):
     return f"non-ASCII symbol (category {category})"
 
 
-def check_filename(filename, max_bytes=255, extra_allowed=""):
+def check_filename(filename, max_length=255, extra_allowed=""):
     """Return (is_valid, reason). Reason is empty when the name is valid."""
     if not isinstance(filename, str):
         return False, f"Filename must be a string, got {type(filename).__name__}."
@@ -53,9 +53,8 @@ def check_filename(filename, max_bytes=255, extra_allowed=""):
     if not filename.strip():
         return False, "Filename is empty or contains only whitespace."
 
-    size = len(filename.encode("utf-8"))
-    if size > max_bytes:
-        return False, f"Filename is {size} bytes long, max is {max_bytes}."
+    if len(filename) > max_length:
+        return False, f"Filename is {len(filename)} characters long, max is {max_length}."
 
     allowed = SAFE_ASCII.union(extra_allowed) if extra_allowed else SAFE_ASCII
 
@@ -77,15 +76,15 @@ def check_filename(filename, max_bytes=255, extra_allowed=""):
     return True, ""
 
 
-def find_all_invalid(filename, extra_allowed=""):
-    """Return every rejected character as a list of (position, char, reason)."""
-    allowed = SAFE_ASCII.union(extra_allowed) if extra_allowed else SAFE_ASCII
-    issues = []
-    for position, char in enumerate(filename):
-        reason = _reject_reason(char, allowed)
-        if reason:
-            issues.append((position, char, f"U+{ord(char):04X}: {reason}"))
-    return issues
+# def find_all_invalid(filename, extra_allowed=""):
+#     """Return every rejected character as a list of (position, char, reason)."""
+#     allowed = SAFE_ASCII.union(extra_allowed) if extra_allowed else SAFE_ASCII
+#     issues = []
+#     for position, char in enumerate(filename):
+#         reason = _reject_reason(char, allowed)
+#         if reason:
+#             issues.append((position, char, f"U+{ord(char):04X}: {reason}"))
+#     return issues
 
 
 if __name__ == "__main__":
