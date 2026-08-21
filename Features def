@@ -26,3 +26,15 @@
 - `type_token_ratio` — number of distinct words divided by the total number of words.
 - `repeated_word_ratio` — share of words in the hypothesis that are duplicates of another word in it.
 - `max_word_repeat` — number of occurrences of the most frequent word in the hypothesis.
+
+### Extra features (additional signals beyond proxy and text)
+
+- `x_is_operator` — whether the speaker on this segment is the operator rather than the client.
+- `x_repeated_bigram_ratio` — share of two-word sequences in the hypothesis that occur more than once.
+- `x_repeated_trigram_ratio` — share of three-word sequences in the hypothesis that occur more than once.
+- `x_orphan_word_ratio` — share of words in the hypothesis that appear in none of the proxy hypotheses.
+- `x_orphan_word_count` — number of words in the hypothesis that appear in none of the proxy hypotheses.
+- `x_ctx_pwer_prev` — average proxy disagreement of the preceding segment in the same call.
+- `x_ctx_pwer_next` — average proxy disagreement of the following segment in the same call.
+- `x_ctx_pwer_call` — average proxy disagreement across all segments of the call.
+- `x_ctx_position` — relative position of the segment within the call, from start (0) to end (1).
