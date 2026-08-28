@@ -1,4 +1,440 @@
 
+"""
+Calibration set sizing for LLM-as-a-judge evaluation.
+
+Answers "how much data do I need to annotate?" for a business requirement of
+the form: "criterion crit_j must be MET for at least theta of the drafts,
+with a confidence interval no wider than W".
+
+The statistics come from the authors' own package, so nothing here
+reimplements the paper:
+
+    pip install git+https://github.com/UW-Madison-Lee-Lab/LLM-judge-reporting.git
+
+    point_estimator            eq. (4)   bias-adjusted theta
+    confidence_interval        eq. (5)   interval accounting for test + calibration
+    allocate_calibration_sample Alg. 1   optimal split of a budget into (m0, m1)
+
+What this module adds, none of which exists upstream:
+  - p_from_theta          business target -> the p the formulas expect
+  - one-sided bounds      "at least 80%" is a one-sided requirement
+  - balanced / random allocation modes, for when stratifying is not possible
+  - required_calibration_size: inverts the interval formula to get the budget
+  - a two-phase pilot workflow and the final reporting helpers
+
+Reference: Lee, Zeng, Jeong, Sohn & Lee, "How to Correctly Report
+LLM-as-a-Judge Evaluations", arXiv:2511.21140.
+
+Notation
+--------
+theta : true proportion of drafts for which the criterion is MET (human truth)
+p     : proportion of drafts the LLM judge marks as MET on the test set
+q1    : sensitivity, Pr(judge = MET | truth = MET)
+q0    : specificity, Pr(judge = NOT MET | truth = NOT MET)
+n     : test set size, judged by the LLM only (no annotation cost)
+m1    : calibration items whose TRUE label is MET
+m0    : calibration items whose TRUE label is NOT MET
+"""
+
+import warnings
+
+from llm_judge_reporting.allocation import allocate_calibration_sample
+from llm_judge_reporting.calibration import confidence_interval, point_estimator
+
+__all__ = [
+    "point_estimator", "confidence_interval", "p_from_theta", "bounds",
+    "interval_width", "lower_margin", "allocate", "floor_width",
+    "required_calibration_size", "sizing_table", "plan_pilot",
+    "plan_after_pilot", "judge_accuracies", "report_criterion",
+]
+
+
+# ------------------------------------------------------------ thin wrappers
+
+
+def p_from_theta(theta, q0, q1):
+    """Expected judged proportion p for a true accuracy theta.
+
+    Inverse of point_estimator. The business states theta; every formula in
+    the paper is written in terms of p, so the widget must convert.
+    """
+    if q0 + q1 <= 1:
+        raise ValueError("judge must be better than random: q0 + q1 > 1")
+    return (q0 + q1 - 1) * theta + (1 - q0)
+
+
+def bounds(p, q0, q1, n, m0, m1, alpha=0.05, one_sided=False):
+    """Confidence bounds for theta, delegating to the authors' implementation.
+
+    A one-sided (1 - alpha) lower bound is the lower end of their two-sided
+    interval at level 2 * alpha, since norm.ppf(1 - alpha) == the two-sided
+    quantile at 2 * alpha. With one_sided=True the upper bound is returned as
+    None to avoid it being read as a (1 - alpha) bound.
+    """
+    lo, hi = confidence_interval(p, q0, q1, int(n), int(m0), int(m1),
+                                 alpha=2 * alpha if one_sided else alpha)
+    return (lo, None) if one_sided else (lo, hi)
+
+
+def interval_width(p, q0, q1, n, m0, m1, alpha=0.05):
+    """Length of the REPORTED two-sided interval, i.e. after truncation to [0, 1].
+
+    This is what Figure 3 of the paper plots. Using 2 * z * SE instead
+    overstates it whenever theta sits near 0 or 1.
+    """
+    lo, hi = bounds(p, q0, q1, n, m0, m1, alpha)
+    return hi - lo
+
+
+def lower_margin(p, q0, q1, n, m0, m1, alpha=0.05):
+    """Distance from the point estimate down to the one-sided lower bound."""
+    lo, _ = bounds(p, q0, q1, n, m0, m1, alpha, one_sided=True)
+    return max(point_estimator(p, q0, q1) - lo, 0.0)
+
+
+def allocate(m, p, q0, q1, mode="adaptive", theta=None, m_pilot=0):
+    """Split a total calibration budget m into (m0, m1).
+
+    mode="adaptive"  Algorithm 1 upstream. Shortest interval, but requires
+                     stratifying by TRUE label before annotating.
+    mode="balanced"  m0 = m1. Robust default when q0, q1 are unknown.
+    mode="random"    composition of a plain random sample: m1 ~ theta * m.
+                     No stratification needed, wider interval.
+
+    Both sides are floored at max(m_pilot, 1): upstream can return m1 = 0 for
+    small budgets or extreme p, which its own confidence_interval rejects.
+    """
+    m = int(m)
+    floor = max(int(m_pilot), 1)
+    if m < 2 * floor:
+        raise ValueError("budget m=%d too small for m_pilot=%d" % (m, m_pilot))
+
+    if mode == "balanced":
+        m1 = m // 2
+    elif mode == "random":
+        if theta is None:
+            raise ValueError("mode='random' needs theta")
+        m1 = round(theta * m)
+    elif mode == "adaptive":
+        with warnings.catch_warnings():
+            # upstream warns when m_pilot == 0; that is the intended use here,
+            # q0/q1 being assumptions rather than pilot measurements
+            warnings.simplefilter("ignore")
+            _, m1 = allocate_calibration_sample(m, p, q0, q1,
+                                                m_pilot=int(m_pilot))
+    else:
+        raise ValueError("unknown mode: %s" % mode)
+
+    m1 = int(min(max(m1, floor), m - floor))
+    return m - m1, m1
+
+
+# ------------------------------------------------------- the widget question
+
+
+def _width_at(m, theta, q0, q1, n, alpha, mode, one_sided, m_pilot):
+    """Reported width (two-sided) or lower margin (one-sided) for a budget m."""
+    p = p_from_theta(theta, q0, q1)
+    m0, m1 = allocate(m, p, q0, q1, mode=mode, theta=theta, m_pilot=m_pilot)
+    if one_sided:
+        return lower_margin(p, q0, q1, n, m0, m1, alpha)
+    return interval_width(p, q0, q1, n, m0, m1, alpha)
+
+
+def floor_width(theta, q0, q1, n, alpha=0.05, mode="adaptive",
+                one_sided=False, m_pilot=0, huge=10 ** 7):
+    """Width still left when annotation is free: the test-set term alone.
+
+    No calibration budget brings the reported width below this. If the target
+    is under this floor, the test set itself must grow.
+    """
+    return _width_at(huge, theta, q0, q1, n, alpha, mode, one_sided, m_pilot)
+
+
+def required_calibration_size(theta, target, q0, q1, n, alpha=0.05,
+                              mode="adaptive", one_sided=False, m_pilot=0,
+                              max_budget=200000):
+    """How many drafts must a human annotate?
+
+    theta   business target, e.g. 0.80 for "MET for at least 80% of drafts"
+    target  two-sided: maximum interval LENGTH (0.20 for "+/- 10%")
+            one_sided: maximum distance below the estimate
+    q0, q1  assumed, or pilot-estimated, judge specificity / sensitivity
+    n       test set size
+
+    The budget is the one that meets the target IF the observed p matches
+    p_from_theta(theta, q0, q1). It is a planning figure, not a guarantee:
+    the interval actually obtained depends on the annotations.
+
+    Returns a dict, or None if the target is unreachable at any budget.
+    """
+    def w(m):
+        return _width_at(m, theta, q0, q1, n, alpha, mode, one_sided, m_pilot)
+
+    lowest = floor_width(theta, q0, q1, n, alpha, mode, one_sided, m_pilot)
+    if lowest > target:
+        return None
+
+    start = 2 * max(int(m_pilot), 1)
+    if w(start) <= target:
+        best = start
+    else:
+        low, high = start, max_budget
+        if w(high) > target:
+            return None
+        while low < high:
+            mid = (low + high) // 2
+            if w(mid) <= target:
+                high = mid
+            else:
+                low = mid + 1
+        best = low
+        # integer rounding of the allocation can make w() locally non-monotone
+        while best > start and w(best - 1) <= target:
+            best -= 1
+
+    p = p_from_theta(theta, q0, q1)
+    m0, m1 = allocate(best, p, q0, q1, mode=mode, theta=theta, m_pilot=m_pilot)
+    return {
+        "total": best,
+        "m0_not_met": m0,
+        "m1_met": m1,
+        "reached": w(best),
+        "bounds": bounds(p, q0, q1, n, m0, m1, alpha, one_sided),
+        "p_expected": p,
+        "floor": lowest,
+        "mode": mode,
+        "one_sided": one_sided,
+    }
+
+
+def sizing_table(theta, target, n, alpha=0.05, mode="adaptive",
+                 one_sided=False, m_pilot=0,
+                 judge_grid=((0.95, 0.95), (0.90, 0.90), (0.85, 0.85),
+                             (0.80, 0.80), (0.70, 0.90), (0.90, 0.70))):
+    """Budget across plausible judge qualities, since q0/q1 are unknown up front.
+
+    This is the honest output for a widget with no pilot data: a range, not a
+    single number.
+    """
+    return [(q0, q1, required_calibration_size(theta, target, q0, q1, n, alpha,
+                                               mode=mode, one_sided=one_sided,
+                                               m_pilot=m_pilot))
+            for q0, q1 in judge_grid]
+
+
+# ------------------------------------------------------ two-phase annotation
+
+
+def plan_pilot(theta, target, n, alpha=0.05, m_pilot=10, one_sided=False,
+               pessimistic=(0.80, 0.80)):
+    """Phase 1: what to annotate before anything is known about the judge.
+
+    Returns the pilot batch (m_pilot per true label) plus a worst-case total,
+    so the annotation team can be warned of the likely order of magnitude.
+    """
+    q0, q1 = pessimistic
+    worst = required_calibration_size(theta, target, q0, q1, n, alpha,
+                                      one_sided=one_sided, m_pilot=m_pilot)
+    return {
+        "pilot_m0_not_met": m_pilot,
+        "pilot_m1_met": m_pilot,
+        "pilot_total": 2 * m_pilot,
+        "worst_case_total": worst["total"] if worst else None,
+        "assumed_judge": pessimistic,
+    }
+
+
+def plan_after_pilot(theta, target, q0_pilot, q1_pilot, n, alpha=0.05,
+                     m_pilot=10, mode="adaptive", one_sided=False):
+    """Phase 2: budget and split, now that the pilot has measured the judge.
+
+    'extra_*' is what still has to be annotated on top of the pilot batch.
+    """
+    res = required_calibration_size(theta, target, q0_pilot, q1_pilot, n, alpha,
+                                    mode=mode, one_sided=one_sided,
+                                    m_pilot=m_pilot)
+    if res is None:
+        return None
+    res["extra_m0_not_met"] = max(res["m0_not_met"] - m_pilot, 0)
+    res["extra_m1_met"] = max(res["m1_met"] - m_pilot, 0)
+    res["extra_total"] = res["extra_m0_not_met"] + res["extra_m1_met"]
+    return res
+
+
+def judge_accuracies(annotations):
+    """Estimate (q0, q1, m0, m1) from annotated items.
+
+    annotations: iterable of (human_label, judge_label), 1 = MET, 0 = NOT MET.
+    """
+    m0 = m1 = hits0 = hits1 = 0
+    for human, judge in annotations:
+        if human == 1:
+            m1 += 1
+            hits1 += judge == 1
+        else:
+            m0 += 1
+            hits0 += judge == 0
+    if m0 == 0 or m1 == 0:
+        raise ValueError("both true labels must be present in the calibration set")
+    return hits0 / m0, hits1 / m1, m0, m1
+
+
+def report_criterion(criterion, p_observed, annotations, n, theta_required,
+                     alpha=0.05, one_sided=True):
+    """Final answer to the business: is the criterion met, and how sure are we?
+
+    p_observed: fraction of the n test drafts the judge marked MET
+    annotations: the calibration set, as in judge_accuracies
+
+    The verdict uses the lower bound, so 'pass' means the requirement holds
+    even in the unfavourable direction of the uncertainty.
+    """
+    q0, q1, m0, m1 = judge_accuracies(annotations)
+    lo, hi = bounds(p_observed, q0, q1, n, m0, m1, alpha, one_sided)
+    return {
+        "criterion": criterion,
+        "naive_judge_rate": p_observed,
+        "corrected_estimate": point_estimator(p_observed, q0, q1),
+        "lower_bound": lo,
+        "upper_bound": hi,
+        "q0": q0, "q1": q1, "m0": m0, "m1": m1,
+        "required": theta_required,
+        "verdict": "pass" if lo >= theta_required else "not proven",
+    }
+
+
+# ------------------------------------------------------------------- figure
+
+
+def plot_interval_length(q0=0.7, q1=0.9, p_values=(0.3, 0.5, 0.7, 0.9),
+                         n=10 ** 9, alpha=0.05, path="ci_length.png"):
+    """Reproduce Figure 3: reported interval length vs calibration size.
+
+    Dashed = balanced split (m0 = m1), solid = adaptive allocation.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    budgets = np.unique(np.logspace(2, 4, 60).astype(int))
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for p in p_values:
+        balanced, adaptive = [], []
+        for m in budgets:
+            b0, b1 = allocate(m, p, q0, q1, mode="balanced")
+            a0, a1 = allocate(m, p, q0, q1, mode="adaptive")
+            balanced.append(interval_width(p, q0, q1, n, b0, b1, alpha))
+            adaptive.append(interval_width(p, q0, q1, n, a0, a1, alpha))
+        line, = ax.plot(budgets, adaptive, label="p = %.1f" % p)
+        ax.plot(budgets, balanced, "--", color=line.get_color(), alpha=0.6)
+    ax.set_xscale("log")
+    ax.set_xlabel("calibration set size (m0 + m1)")
+    ax.set_ylabel("confidence interval length")
+    ax.set_title("q0 = %.2f, q1 = %.2f (dashed: m0 = m1)" % (q0, q1))
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    return path
+
+
+# ---------------------------------------------------------------- self-test
+
+
+def _self_test():
+    """Checks on the parts that are not delegated upstream."""
+    from scipy.stats import norm
+    # one-sided bound == two-sided bound at level 2 * alpha
+    lo1, _ = bounds(0.74, 0.9, 0.9, 10000, 65, 185, alpha=0.05, one_sided=True)
+    lo2, _ = confidence_interval(0.74, 0.9, 0.9, 10000, 65, 185, alpha=0.10)
+    assert abs(lo1 - lo2) < 1e-12
+    assert abs(norm.ppf(0.95) - norm.ppf(1 - 0.10 / 2)) < 1e-12
+    # p_from_theta inverts point_estimator
+    for theta in (0.05, 0.5, 0.95):
+        assert abs(point_estimator(p_from_theta(theta, 0.8, 0.9), 0.8, 0.9)
+                   - theta) < 1e-12
+    # Figure 3 anchor: p = 0.3, q0 = 0.7, q1 = 0.9, m0 = m1 = 200 -> about 0.10
+    anchor = interval_width(0.3, 0.7, 0.9, 10 ** 9, 200, 200)
+    assert 0.09 < anchor < 0.11, anchor
+    # the solver returns the smallest budget that meets the target
+    r = required_calibration_size(0.80, 0.10, 0.9, 0.9, 10000)
+    assert r["reached"] <= 0.10
+    assert _width_at(r["total"] - 1, 0.80, 0.9, 0.9, 10000, 0.05,
+                     "adaptive", False, 0) > 0.10
+    return {"fig3_anchor": anchor, "solver_total": r["total"]}
+
+
+# ------------------------------------------------------------------- usage
+
+
+if __name__ == "__main__":
+    print("self-test:", _self_test(), "\n")
+
+    # The business request from the issue:
+    #   "we want 'syntax correctness' MET for at least 80% of generated
+    #    drafts, with a confidence interval of at most +/- 10%"
+    CRITERION = "syntax correctness"
+    THETA = 0.80          # minimum performance expected by the business
+    MAX_CI = 0.20         # "+/- 10%" is an interval of LENGTH 0.20
+    N_TEST = 10000        # drafts judged by the LLM, no annotation cost
+
+    print("=== Level 1: budget before anything is known about the judge ===")
+    for q0, q1, res in sizing_table(THETA, MAX_CI, N_TEST):
+        print("  judge q0=%.2f q1=%.2f -> annotate %4d  (%d NOT MET / %d MET)"
+              % (q0, q1, res["total"], res["m0_not_met"], res["m1_met"]))
+    print("  -> quote a range, not a number: the budget is driven by the")
+    print("     judge quality, which is exactly what is not yet known.\n")
+
+    print("=== Level 2: two-phase plan ===")
+    phase1 = plan_pilot(THETA, MAX_CI, N_TEST, m_pilot=10)
+    print("  phase 1: annotate %d items (%d per true label), worst case total %d"
+          % (phase1["pilot_total"], phase1["pilot_m0_not_met"],
+             phase1["worst_case_total"]))
+
+    # suppose the pilot measured a judge at q0 = 0.85, q1 = 0.92
+    phase2 = plan_after_pilot(THETA, MAX_CI, 0.85, 0.92, N_TEST, m_pilot=10)
+    print("  phase 2: total %d -> %d NOT MET / %d MET, i.e. %d more to annotate"
+          % (phase2["total"], phase2["m0_not_met"], phase2["m1_met"],
+             phase2["extra_total"]))
+    print("           expected interval %.3f - %.3f\n"
+          % phase2["bounds"])
+
+    print("=== What stratifying actually buys ===")
+    for mode in ("adaptive", "balanced", "random"):
+        r = required_calibration_size(THETA, MAX_CI, 0.85, 0.92, N_TEST,
+                                      mode=mode)
+        print("  %-9s %4d items (%d / %d)"
+              % (mode, r["total"], r["m0_not_met"], r["m1_met"]))
+    print("  -> 'random' needs no stratification; compare before promising")
+    print("     the business a label-balanced annotation campaign.\n")
+
+    print("=== One-sided: the requirement is 'at least 80%', not '80% +/- 10%' ===")
+    two = required_calibration_size(THETA, 0.10, 0.85, 0.92, N_TEST)
+    one = required_calibration_size(THETA, 0.05, 0.85, 0.92, N_TEST,
+                                    one_sided=True)
+    print("  two-sided, length <= 0.10 : %d items" % two["total"])
+    print("  one-sided, margin <= 0.05 : %d items\n" % one["total"])
+
+    print("=== Feasibility: the test set imposes a floor ===")
+    print("  floor with n=%d : %.4f" % (N_TEST, floor_width(THETA, 0.85, 0.92, N_TEST)))
+    print("  target 0.02 reachable?", required_calibration_size(
+        THETA, 0.02, 0.85, 0.92, N_TEST) is not None, "\n")
+
+    print("=== Reporting, once the annotation campaign is done ===")
+    # 340 of the 10000 drafts were judged MET... plus a calibration set
+    import random
+    random.seed(0)
+    q0_true, q1_true = 0.85, 0.92
+    calib = ([(1, 1 if random.random() < q1_true else 0) for _ in range(185)]
+             + [(0, 0 if random.random() < q0_true else 1) for _ in range(65)])
+    out = report_criterion(CRITERION, 0.78, calib, N_TEST, THETA)
+    print("  naive judge rate    : %.3f" % out["naive_judge_rate"])
+    print("  bias-corrected      : %.3f" % out["corrected_estimate"])
+    print("  95%% lower bound     : %.3f" % out["lower_bound"])
+    print("  required            : %.2f" % out["required"])
+    print("  verdict             : %s" % out["verdict"])
+
+
+
 
 ----- V2
 """
