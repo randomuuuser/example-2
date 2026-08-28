@@ -1,3 +1,348 @@
+
+
+----- V2
+"""
+Calibration set sizing for LLM-as-a-judge evaluation.
+
+Implements the estimator, confidence interval and adaptive allocation of
+Lee, Zeng, Jeong, Sohn & Lee, "How to Correctly Report LLM-as-a-Judge
+Evaluations" (arXiv:2511.21140), plus the inversion needed to answer
+"how much data do I need to annotate?".
+
+point_estimator / confidence_interval / allocate_calibration are checked
+against the authors' reference implementation (UW-Madison-Lee-Lab/
+LLM-judge-reporting) in the self-test at the bottom of this file.
+
+Notation
+--------
+theta : true proportion of items for which the criterion is MET (human truth)
+p     : proportion of items the LLM judge marks as MET on the test set
+q1    : sensitivity, Pr(judge = MET | truth = MET)
+q0    : specificity, Pr(judge = NOT MET | truth = NOT MET)
+n     : test set size (judged by the LLM, no annotation cost)
+m1    : calibration items whose TRUE label is MET
+m0    : calibration items whose TRUE label is NOT MET
+"""
+
+from math import sqrt
+
+from scipy.stats import norm
+
+
+# ---------------------------------------------------------------- estimators
+
+
+def clip(x, low=0.0, high=1.0):
+    """Clip a value to [low, high]."""
+    return max(low, min(high, x))
+
+
+def point_estimator(p, q0, q1):
+    """Bias-adjusted estimate of theta (Rogan-Gladen, eq. 4 of the paper)."""
+    if q0 + q1 <= 1:
+        raise ValueError("judge must be better than random: q0 + q1 > 1")
+    return clip((p + q0 - 1) / (q0 + q1 - 1))
+
+
+def p_from_theta(theta, q0, q1):
+    """Expected judged proportion p given a true accuracy theta.
+
+    Inverse of point_estimator. Turns a business target ("criterion MET for
+    at least 80% of drafts") into the p the interval formula needs.
+    """
+    return (q0 + q1 - 1) * theta + (1 - q0)
+
+
+def confidence_interval(p, q0, q1, n, m0, m1, alpha=0.05, one_sided=False):
+    """(1 - alpha) interval for theta, eq. (5) of the paper.
+
+    Bounds are truncated to [0, 1], as in the reference implementation.
+    With one_sided=True only the lower bound is meaningful, which is what a
+    "theta >= 80%" requirement actually needs.
+    """
+    if q0 + q1 <= 1:
+        raise ValueError("judge must be better than random: q0 + q1 > 1")
+    m0, m1, n = int(m0), int(m1), int(n)
+    if m0 < 1 or m1 < 1:
+        raise ValueError("m0 and m1 must be >= 1")
+
+    z = norm.ppf(1 - alpha) if one_sided else norm.ppf(1 - alpha / 2)
+    # tilde quantities, eq. (6): "add two successes and two failures"
+    p, q0, q1 = (n * p + z ** 2 / 2) / (n + z ** 2), \
+                (m0 * q0 + 1) / (m0 + 2), (m1 * q1 + 1) / (m1 + 2)
+    n, m0, m1 = n + z ** 2, m0 + 2, m1 + 2
+
+    th = (p + q0 - 1) / (q0 + q1 - 1)
+    dth = 2 * z ** 2 * (
+        -(1 - th) * q0 * (1 - q0) / m0 + th * q1 * (1 - q1) / m1
+    )
+    se = sqrt(
+        p * (1 - p) / n
+        + (1 - th) ** 2 * q0 * (1 - q0) / m0
+        + th ** 2 * q1 * (1 - q1) / m1
+    ) / (q0 + q1 - 1)
+    return clip(th + dth - z * se), clip(th + dth + z * se)
+
+
+def interval_width(p, q0, q1, n, m0, m1, alpha=0.05):
+    """Length of the REPORTED interval, i.e. after truncation to [0, 1].
+
+    This is what Figure 3 of the paper plots. Using 2 * z * SE instead
+    overstates the length whenever theta sits near 0 or 1, which is exactly
+    the regime of a business target like theta = 0.80 with a good judge.
+    """
+    lo, hi = confidence_interval(p, q0, q1, n, m0, m1, alpha)
+    return hi - lo
+
+
+def lower_margin(p, q0, q1, n, m0, m1, alpha=0.05):
+    """Distance from the point estimate down to the one-sided lower bound."""
+    lo, _ = confidence_interval(p, q0, q1, n, m0, m1, alpha, one_sided=True)
+    return max(point_estimator(p, q0, q1) - lo, 0.0)
+
+
+# --------------------------------------------------------------- allocation
+
+
+def allocate_calibration(m, p, q0, q1, mode="adaptive", theta=None,
+                         m_pilot=0, eps=1e-6):
+    """Split a total calibration budget m into (m0, m1).
+
+    mode="adaptive"  Algorithm 1: m0 ~ (1/p - 1) * sqrt(kappa) * m1.
+                     kappa uses the pilot-adjusted error rates when
+                     m_pilot > 0, matching the reference implementation:
+                     kappa = (m_pilot*(1-q0) + 1) / (m_pilot*(1-q1) + 1).
+                     Shortest interval, but requires stratifying by TRUE
+                     label before annotating.
+    mode="balanced"  m0 = m1. Robust default when q0, q1 are unknown.
+    mode="random"    composition of a plain random sample: m1 ~ theta * m.
+                     No stratification needed, wider interval.
+
+    m_pilot also acts as a floor on each side, so neither q0 nor q1 is
+    estimated from a handful of items.
+    """
+    m = int(m)
+    floor = max(m_pilot, 1)
+    if m < 2 * floor:
+        # Algorithm 1 requires 2 * m_pilot <= m; the reference implementation
+        # silently returns a negative m0 here instead of failing.
+        raise ValueError("budget m=%d too small for m_pilot=%d" % (m, m_pilot))
+    if mode == "balanced":
+        m1 = m // 2
+    elif mode == "random":
+        if theta is None:
+            raise ValueError("mode='random' needs theta")
+        m1 = round(theta * m)
+    elif mode == "adaptive":
+        if p < eps:
+            m1 = m - max(m_pilot, 1)
+        else:
+            if m_pilot > 0:
+                kappa = (m_pilot * (1 - q0) + 1) / (m_pilot * (1 - q1) + 1)
+            else:
+                kappa = (1 - q0) / max(1 - q1, eps)
+            m1 = round(m / (1 + (1 / p - 1) * sqrt(kappa)))
+    else:
+        raise ValueError("unknown mode: %s" % mode)
+
+    m1 = int(min(max(m1, floor), m - floor))
+    return m - m1, m1
+
+
+def _width_at(m, theta, q0, q1, n, alpha, mode, one_sided, m_pilot):
+    """Reported width (or lower margin) for a total budget m."""
+    p = p_from_theta(theta, q0, q1)
+    m0, m1 = allocate_calibration(m, p, q0, q1, mode=mode, theta=theta,
+                                  m_pilot=m_pilot)
+    if one_sided:
+        return lower_margin(p, q0, q1, n, m0, m1, alpha)
+    return interval_width(p, q0, q1, n, m0, m1, alpha)
+
+
+def floor_width(theta, q0, q1, n, alpha=0.05, mode="adaptive",
+                one_sided=False, m_pilot=0, huge=10 ** 7):
+    """Width still left when annotation is free: the test-set term alone.
+
+    No calibration budget brings the reported width below this value.
+    """
+    return _width_at(huge, theta, q0, q1, n, alpha, mode, one_sided, m_pilot)
+
+
+# ------------------------------------------------------- the widget question
+
+
+def required_calibration_size(
+    theta,
+    target,
+    q0,
+    q1,
+    n,
+    alpha=0.05,
+    mode="adaptive",
+    one_sided=False,
+    m_pilot=0,
+    max_budget=200000,
+):
+    """How many items must a human annotate?
+
+    theta   business target, e.g. 0.80 for "MET for at least 80% of drafts"
+    target  two-sided: maximum interval LENGTH (0.20 for "+/- 10%")
+            one_sided: maximum distance below the estimate
+    q0, q1  assumed (or pilot-estimated) judge specificity / sensitivity
+    n       test set size
+
+    The budget is the one that meets the target IF the observed p matches
+    p_from_theta(theta, q0, q1); it is a planning figure, not a guarantee.
+
+    Returns a dict, or None if the target is unreachable at any budget.
+    """
+    def w(m):
+        return _width_at(m, theta, q0, q1, n, alpha, mode, one_sided, m_pilot)
+
+    lowest = floor_width(theta, q0, q1, n, alpha, mode, one_sided, m_pilot)
+    if lowest > target:
+        return None
+
+    start = max(4, 2 * max(m_pilot, 1) + 2)
+    if w(start) <= target:
+        best = start
+    else:
+        low, high = start, max_budget
+        if w(high) > target:
+            return None
+        while low < high:  # bisection, then a backward scan below
+            mid = (low + high) // 2
+            if w(mid) <= target:
+                high = mid
+            else:
+                low = mid + 1
+        best = low
+        # clipping and integer rounding can make w() locally non-monotone,
+        # so walk down while the target is still met
+        while best > start and w(best - 1) <= target:
+            best -= 1
+
+    p = p_from_theta(theta, q0, q1)
+    m0, m1 = allocate_calibration(best, p, q0, q1, mode=mode, theta=theta,
+                                  m_pilot=m_pilot)
+    lo, hi = confidence_interval(p, q0, q1, n, m0, m1, alpha, one_sided)
+    return {
+        "total": best,
+        "m0_not_met": m0,
+        "m1_met": m1,
+        "reached": w(best),
+        "interval": (lo, hi) if not one_sided else (lo, None),
+        "p_expected": p,
+        "floor": lowest,
+        "mode": mode,
+    }
+
+
+def sizing_table(theta, target, n, alpha=0.05, mode="adaptive",
+                 one_sided=False, m_pilot=0,
+                 judge_grid=((0.95, 0.95), (0.90, 0.90), (0.85, 0.85),
+                             (0.80, 0.80), (0.70, 0.90), (0.90, 0.70))):
+    """Budget across plausible judge qualities, since q0/q1 are unknown up front.
+
+    This is the honest output for a widget with no pilot data: a range, not
+    a single number.
+    """
+    rows = []
+    for q0, q1 in judge_grid:
+        rows.append((q0, q1, required_calibration_size(
+            theta, target, q0, q1, n, alpha, mode=mode,
+            one_sided=one_sided, m_pilot=m_pilot)))
+    return rows
+
+
+# ------------------------------------------------------------------- figure
+
+
+def plot_interval_length(q0=0.7, q1=0.9, p_values=(0.3, 0.5, 0.7, 0.9),
+                         n=10 ** 9, alpha=0.05, path="ci_length.png"):
+    """Reproduce Figure 3: reported interval length vs calibration size.
+
+    Dashed = balanced split (m0 = m1), solid = adaptive allocation.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    budgets = np.unique(np.logspace(2, 4, 60).astype(int))
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for p in p_values:
+        balanced, adaptive = [], []
+        for m in budgets:
+            b0, b1 = allocate_calibration(m, p, q0, q1, mode="balanced")
+            a0, a1 = allocate_calibration(m, p, q0, q1, mode="adaptive")
+            balanced.append(interval_width(p, q0, q1, n, b0, b1, alpha))
+            adaptive.append(interval_width(p, q0, q1, n, a0, a1, alpha))
+        line, = ax.plot(budgets, adaptive, label="p = %.1f" % p)
+        ax.plot(budgets, balanced, "--", color=line.get_color(), alpha=0.6)
+    ax.set_xscale("log")
+    ax.set_xlabel("calibration set size (m0 + m1)")
+    ax.set_ylabel("confidence interval length")
+    ax.set_title("q0 = %.2f, q1 = %.2f (dashed: m0 = m1)" % (q0, q1))
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    return path
+
+
+# ---------------------------------------------------------------- self-test
+
+
+def _self_test(trials=2000, seed=0):
+    """Check against the authors' package, if installed.
+
+    pip install git+https://github.com/UW-Madison-Lee-Lab/LLM-judge-reporting.git
+    """
+    import random
+    import warnings
+    from llm_judge_reporting.calibration import confidence_interval as ref_ci
+    from llm_judge_reporting.allocation import allocate_calibration_sample as ref_al
+
+    random.seed(seed)
+    worst = 0.0
+    for _ in range(trials):
+        p = random.uniform(0.02, 0.98)
+        q0 = random.uniform(0.55, 0.99)
+        q1 = random.uniform(0.55, 0.99)
+        n = random.randint(50, 20000)
+        m0 = random.randint(3, 3000)
+        m1 = random.randint(3, 3000)
+        if q0 + q1 <= 1:
+            continue
+        a = ref_ci(p, q0, q1, n, m0, m1)
+        b = confidence_interval(p, q0, q1, n, m0, m1)
+        worst = max(worst, abs(a[0] - b[0]), abs(a[1] - b[1]))
+        mp = random.choice([0, 10, 30])
+        # tiny budgets excluded: the reference can return m1 = 0 there,
+        # which its own confidence_interval rejects; we floor each side at 1
+        m = random.randint(max(20, 2 * max(mp, 1)), 5000)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ra = ref_al(m, p, q0, q1, m_pilot=mp)
+        ma = allocate_calibration(m, p, q0, q1, m_pilot=mp)
+        assert ra == ma, (m, p, q0, q1, mp, ra, ma)
+    # Figure 3 anchor: p = 0.3, q0 = 0.7, q1 = 0.9, m0 = m1 = 200 -> ~0.10
+    anchor = interval_width(0.3, 0.7, 0.9, 10 ** 9, 200, 200)
+    assert 0.09 < anchor < 0.11, anchor
+    return {"max_ci_diff": worst, "fig3_anchor": anchor}
+
+
+if __name__ == "__main__":
+    print("self-test:", _self_test())
+    print()
+    # Business asks: criterion MET for at least 80% of drafts, +/- 10%
+    for q0, q1, res in sizing_table(theta=0.80, target=0.20, n=10000):
+        print("q0=%.2f q1=%.2f -> %s" % (q0, q1, res))
+
+
+
+
+
+
+-------- V1
 """
 Calibration set sizing for LLM-as-a-judge evaluation.
 
