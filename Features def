@@ -40,3 +40,30 @@
 - `x_ctx_position` — relative position of the segment within the call, from start (0) to end (1).
 
 
+Hello everyone,
+
+Thank you to everyone who joined the meeting for the discussion. It was a very interesting exchange.
+
+I wanted to share a brief summary of the decisions reached during the meeting, as well as the points that still need to be clarified. This should also give those who could not attend a brief overview of what was discussed.
+
+The discussion focused on the points raised in my GitLab comment: [comment_xxx].
+
+**Section 1**
+The discussion led to a consensus around the **hybrid approach**.
+
+**Section 2**
+**Option 3** ([option_xxx]) reached consensus, mainly because it better aligns with the evolutionary approach that EvalDash is intended to follow.
+Regarding **LLM-as-a-Judge**, it was agreed that LLM Judges can remain within the **Tasks** rather than being moved to the Analyzer side.
+
+For the remaining points, no consensus was reached during the meeting, as the discussions took longer than the time available. Two main questions therefore remain open:
+
+* **Which tasks from the class diagram of Approach A ([approach_xxx]) should serve as semantic anchors for the hybrid approach?**
+  In particular, should we keep all of them, add new ones, or merge some into parent tasks? And which ones should be prioritized for implementation, based on the tasks most likely to be used by EvalDash users?
+  This corresponds to the points discussed in **Section 2.2 – Semantic hierarchy granularity** and **Section 2.3 – Proposed priority tiers** of the GitLab comment.
+
+* **The points raised in Section 3**, in particular: **what justifies having a specialized input/output specification?**
+
+I hope this message can complement the actions and decisions that Cyril will circulate, particularly for the points that remain open following the discussion.
+
+Thanks again everyone, and please feel free to add or correct anything I may have missed.
+
